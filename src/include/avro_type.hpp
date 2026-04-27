@@ -22,10 +22,10 @@ public:
 		return duckdb_type == other.duckdb_type && avro_type == other.avro_type && children == other.children &&
 		       union_child_map == other.union_child_map;
 	}
-	const bool HasFieldId() const {
+	bool HasFieldId() const {
 		return field_id != NumericLimits<int32_t>::Maximum();
 	}
-	const int32_t GetFieldId() const {
+	int32_t GetFieldId() const {
 		D_ASSERT(HasFieldId());
 		return field_id;
 	}
