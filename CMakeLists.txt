@@ -3,39 +3,8 @@ cmake_minimum_required(VERSION 3.10)
 # Set extension name here
 set(TARGET_NAME avro)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-if (EMSCRIPTEN)
-  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
-  
-  # _LINKED_LIBS influences only Wasm compilation
-  # it's unclear why this is needed, but somehow global symbols aren't properly exported otherwise
-  # this solves by basically re-linking (at the moment the Wasm binary is actually produced)
-  set (DUCKDB_EXTENSION_AVRO_LINKED_LIBS "../../vcpkg_installed/wasm32-emscripten/lib/lib*.a")
-endif()
-
-# Disable avro-c examples, tests, docs
-set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(BUILD_DOCS OFF CACHE BOOL "" FORCE)
-
-# avro-c still declares an old cmake_minimum_required(). With newer CMake
-# releases we need to raise the policy floor before adding the subdirectory.
-set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-
-# Add avro-c from submodule
-add_subdirectory(third_party/avro-c/lang/c EXCLUDE_FROM_ALL)
-
-# Get avro-c include directory
-set(AVRO_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/avro-c/lang/c/src")
-
-# Disable all UBSan checks for avro-static to work around multiple UB issues in avro-c
-if(TARGET avro-static AND NOT MSVC)
-  target_compile_options(avro-static PRIVATE -fno-sanitize=undefined)
-endif()
+set(AVRO_INCLUDE_DIR "")
+set(ALL_AVRO_LIBRARIES "avro-static")
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
