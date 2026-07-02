@@ -701,7 +701,7 @@ static idx_t PopulateValue(avro_value_t *target, const Value &val) {
 	}
 	case LogicalTypeId::TIME: {
 		auto date = val.GetValueUnsafe<dtime_t>();
-		avro_value_set_long(target, date.value);
+		avro_value_set_long(target, date.micros);
 		return sizeof(int64_t);
 	}
 	case LogicalTypeId::TIMESTAMP:

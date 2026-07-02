@@ -29,7 +29,8 @@ public:
 	                       LocalTableFunctionState &lstate) override;
 	AsyncResult Scan(ClientContext &context, GlobalTableFunctionState &global_state,
 	                 LocalTableFunctionState &local_state, DataChunk &chunk) override;
-	InsertionOrderPreservingMap<Value> GetMetadata() const override;
+	// becomes an override once duckdb gains the BaseFileReader::GetMetadata virtual
+	InsertionOrderPreservingMap<Value> GetMetadata() const;
 
 	string GetMetadataValue(const string &key) const;
 
