@@ -4,6 +4,6 @@
 require avro
 
 statement error
-COPY (select range(10000)) TO '{TEST_DIR}/tmp.avro';
+COPY (select range(10000) AS "range(10000)") TO '{TEST_DIR}/tmp.avro';
 ----
 Invalid Avro identifier
