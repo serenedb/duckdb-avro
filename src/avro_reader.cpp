@@ -490,7 +490,7 @@ static void TransformValue(avro_value *avro_val, const AvroType &avro_type, Vect
 		}
 		// avro strings are null-terminated
 		D_ASSERT(const_char_ptr_cast(str_buf.buf)[str_buf.size - 1] == '\0');
-		if (Utf8Proc::Analyze(const_char_ptr_cast(str_buf.buf), str_buf.size - 1) == UnicodeType::INVALID) {
+		if (!Utf8Proc::IsValid(const_char_ptr_cast(str_buf.buf), str_buf.size - 1)) {
 			throw InvalidInputException("Avro file contains invalid unicode string");
 		}
 		FlatVector::GetDataMutable<string_t>(target)[out_idx] =
