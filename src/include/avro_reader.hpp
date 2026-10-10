@@ -10,6 +10,18 @@ namespace duckdb {
 
 class AvroReader;
 
+struct AvroFileReaderClose {
+	void operator()(avro_file_reader_t reader) const {
+		avro_file_reader_close(reader);
+	}
+};
+
+struct AvroValueIfaceDecref {
+	void operator()(avro_value_iface_t *iface) const {
+		avro_value_iface_decref(iface);
+	}
+};
+
 class AvroReaderScanState {
 public:
 	AvroReaderScanState(ClientContext &context, AvroReader &reader);
@@ -28,11 +40,6 @@ class AvroReader : public BaseFileReader {
 public:
 	AvroReader(ClientContext &context, const OpenFileInfo file,
 	           const AvroFileReaderOptions &options = AvroFileReaderOptions());
-
-	~AvroReader() {
-		avro_value_iface_decref(value_iface);
-		avro_file_reader_close(reader);
-	}
 
 public:
 	void Read(AvroReaderScanState &scan_state, DataChunk &output);
@@ -57,8 +64,8 @@ public:
 	string GetMetadataValue(const string &key) const;
 
 public:
-	avro_file_reader_t reader;
-	avro_value_iface_t *value_iface;
+	unique_ptr<std::remove_pointer_t<avro_file_reader_t>, AvroFileReaderClose> reader;
+	unique_ptr<avro_value_iface_t, AvroValueIfaceDecref> value_iface;
 	idx_t block_count;
 
 	AllocatedData local_buffer;
