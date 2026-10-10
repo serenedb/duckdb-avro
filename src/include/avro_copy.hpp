@@ -128,6 +128,12 @@ public:
 	idx_t capacity = 0;
 };
 
+struct AvroFileWriterClose {
+	void operator()(avro_file_writer_t writer) const {
+		avro_file_writer_close(writer);
+	}
+};
+
 struct WriteAvroGlobalState : public GlobalFunctionData {
 public:
 	static constexpr idx_t BUFFER_SIZE = 1024;
@@ -139,7 +145,6 @@ public:
 
 public:
 	WriteAvroGlobalState(ClientContext &context, FunctionData &bind_data_p, FileSystem &fs, const string &file_path);
-	virtual ~WriteAvroGlobalState();
 
 public:
 	void WriteData(const_data_ptr_t data, idx_t size) {
@@ -173,7 +178,7 @@ public:
 	//! The writer for the file
 	avro_writer_t writer;
 	avro_writer_t datum_writer;
-	avro_file_writer_t file_writer;
+	unique_ptr<std::remove_pointer_t<avro_file_writer_t>, AvroFileWriterClose> file_writer;
 
 	//! Running total of bytes written to the file (see BytesWritten()).
 	idx_t bytes_written = 0;

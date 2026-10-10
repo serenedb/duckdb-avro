@@ -164,14 +164,14 @@ void AvroReader::FinishFile(ClientContext &context, GlobalTableFunctionState &gs
 InsertionOrderPreservingMap<Value> AvroReader::GetMetadata() const {
 	InsertionOrderPreservingMap<Value> metadata;
 	size_t metadata_count = 0;
-	if (avro_file_reader_get_metadata_count(reader, &metadata_count)) {
+	if (avro_file_reader_get_metadata_count(reader.get(), &metadata_count)) {
 		throw InvalidInputException("Failed to get metadata count");
 	}
 	for (idx_t i = 0; i < metadata_count; i++) {
 		const char *key = nullptr;
 		const char *value = nullptr;
 		size_t value_size = 0;
-		if (avro_file_reader_get_metadata_by_index(reader, i, &key, &value, &value_size)) {
+		if (avro_file_reader_get_metadata_by_index(reader.get(), i, &key, &value, &value_size)) {
 			throw InvalidInputException("Failed to get metadata at index %llu", i);
 		}
 		if (!key) {
@@ -183,7 +183,7 @@ InsertionOrderPreservingMap<Value> AvroReader::GetMetadata() const {
 }
 
 string AvroReader::GetMetadataValue(const string &key) const {
-	auto res = avro_file_reader_get_metadata(reader, key.c_str());
+	auto res = avro_file_reader_get_metadata(reader.get(), key.c_str());
 	if (!res) {
 		return string();
 	}
