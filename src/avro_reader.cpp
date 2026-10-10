@@ -209,6 +209,12 @@ static AvroType TransformSchema(avro_schema_t &avro_schema, unordered_set<string
 	}
 }
 
+struct AvroSchemaDecref {
+	void operator()(avro_schema_t schema) const {
+		avro_schema_decref(schema);
+	}
+};
+
 AvroReader::AvroReader(ClientContext &context, OpenFileInfo file, const AvroFileReaderOptions &options)
     : BaseFileReader(file) {
 	auto &fs = FileSystem::GetFileSystem(context);
@@ -221,23 +227,27 @@ AvroReader::AvroReader(ClientContext &context, OpenFileInfo file, const AvroFile
 	local_buffer = Allocator::DefaultAllocator().Allocate(total_size);
 	fs.Read(*file_handle, local_buffer.get(), total_size);
 
-	if (avro_file_reader_memory(const_char_ptr_cast(local_buffer.get()), total_size, &reader)) {
+	avro_file_reader_t opened;
+	if (avro_file_reader_memory(const_char_ptr_cast(local_buffer.get()), total_size, &opened)) {
 		throw InvalidInputException(avro_strerror());
 	}
+	reader.reset(opened);
 	size_t file_block_count;
-	if (avro_file_reader_get_block_count(reader, &file_block_count)) {
+	if (avro_file_reader_get_block_count(reader.get(), &file_block_count)) {
 		throw InvalidInputException(avro_strerror());
 	}
 	block_count = file_block_count;
 
-	auto avro_schema = avro_file_reader_get_writer_schema(reader);
+	const unique_ptr<std::remove_pointer_t<avro_schema_t>, AvroSchemaDecref> schema_owner(
+	    avro_file_reader_get_writer_schema(reader.get()));
+	avro_schema_t avro_schema = schema_owner.get();
 	auto schema_name = avro_schema_name(avro_schema);
 	string root_name = schema_name ? schema_name : "avro_schema";
 
 	avro_type = TransformSchema(avro_schema, {});
 	auto root = AvroType::TransformAvroType(root_name, avro_type);
 	duckdb_type = root.type;
-	value_iface = avro_generic_class_from_schema(avro_schema);
+	value_iface.reset(avro_generic_class_from_schema(avro_schema));
 	if (!value_iface) {
 		throw InvalidInputException(avro_strerror());
 	}
@@ -249,14 +259,13 @@ AvroReader::AvroReader(ClientContext &context, OpenFileInfo file, const AvroFile
 		columns.clear();
 		columns.push_back(std::move(root));
 	}
-	avro_schema_decref(avro_schema);
 }
 
 AvroReaderScanState::AvroReaderScanState(ClientContext &context, AvroReader &reader_p) : reader(reader_p) {
-	if (avro_file_block_reader_create(reader.reader, &block_reader)) {
+	if (avro_file_block_reader_create(reader.reader.get(), &block_reader)) {
 		throw InvalidInputException(avro_strerror());
 	}
-	if (avro_generic_value_new(reader.value_iface, &value)) {
+	if (avro_generic_value_new(reader.value_iface.get(), &value)) {
 		avro_file_block_reader_close(block_reader);
 		block_reader = nullptr;
 		throw InvalidInputException(avro_strerror());
