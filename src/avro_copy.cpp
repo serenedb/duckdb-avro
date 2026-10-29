@@ -646,11 +646,10 @@ WriteAvroGlobalState::WriteAvroGlobalState(ClientContext &context, FunctionData 
 	avro_file_writer_t created = nullptr;
 	while ((ret = avro_file_writer_create_from_writers_with_metadata_and_codec(
 	            writer, datum_writer, bind_data.schema, &created, json_metadata, codec)) == ENOSPC) {
-		auto current_capacity = memory_buffer.GetCapacity();
-		memory_buffer.Resize(NextPowerOfTwo(current_capacity * 2));
-		// re-initialize writer to use correct data location
 		avro_file_writer_close(created);
 		created = nullptr;
+		memory_buffer.Resize(NextPowerOfTwo(memory_buffer.GetCapacity() * 2));
+		// re-initialize writer to use correct data location
 		writer = avro_writer_memory(const_char_ptr_cast(memory_buffer.GetData()), memory_buffer.GetCapacity());
 		datum_writer = avro_writer_memory(const_char_ptr_cast(datum_buffer.GetData()), datum_buffer.GetCapacity());
 	}
