@@ -8,28 +8,13 @@
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/common/vector/vector_iterator.hpp"
 #include "duckdb/function/function.hpp"
-#include "yyjson.hpp"
+#include "duckdb/common/json_document.hpp"
 #include "duckdb/common/printer.hpp"
 #include "field_ids.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "errno.h"
 
-using namespace duckdb_yyjson; // NOLINT
-
 namespace duckdb {
-
-namespace {
-
-struct YyjsonDocDeleter {
-	void operator()(yyjson_doc *doc) {
-		yyjson_doc_free(doc);
-	}
-	void operator()(yyjson_mut_doc *doc) {
-		yyjson_mut_doc_free(doc);
-	}
-};
-
-} // namespace
 
 static string ConvertTypeToAvro(const LogicalType &type) {
 	switch (type.id()) {
@@ -178,15 +163,8 @@ private:
 	};
 
 public:
-	JSONSchemaGenerator(const vector<string> &names, const vector<LogicalType> &types) : names(names), types(types) {
-		doc = yyjson_mut_doc_new(nullptr);
-		root_object = yyjson_mut_obj(doc);
-		yyjson_mut_doc_set_root(doc, root_object);
-	}
-	~JSONSchemaGenerator() {
-		if (doc) {
-			yyjson_mut_doc_free(doc);
-		}
+	JSONSchemaGenerator(const vector<string> &names, const vector<LogicalType> &types)
+	    : names(names), types(types), writer(JSONWriteFlags::ALLOW_INF_AND_NAN) {
 	}
 
 public:
@@ -249,30 +227,22 @@ public:
 		return res;
 	}
 
-	bool IsJSONObject(yyjson_mut_val *val) {
-		auto type = yyjson_mut_get_type(val);
-		return type == YYJSON_TYPE_OBJ;
+	void StartTypeObject(const string &avro_type_str) {
+		writer.StartObject();
+		writer.Key("type");
+		writer.String(avro_type_str);
 	}
 
-	yyjson_mut_val *WrapTypeInObject(yyjson_mut_doc *doc, yyjson_mut_val *type_val) {
-		if (IsJSONObject(type_val)) {
-			return type_val;
-		}
-		auto object = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, object, "type", type_val);
-		return object;
-	}
-
-	yyjson_mut_val *CreateJSONType(const LogicalType &type, optional_ptr<avro::FieldID> field_id,
-	                               const char *preset_schema_name = nullptr) {
+	void CreateJSONType(const LogicalType &type, optional_ptr<avro::FieldID> field_id,
+	                    const char *preset_schema_name = nullptr) {
 		auto avro_type_str = ConvertTypeToAvro(type);
-		auto type_val = yyjson_mut_strcpy(doc, avro_type_str.c_str());
 		auto type_id = type.id();
 
 		if (type_id == LogicalTypeId::STRUCT) {
-			type_val = WrapTypeInObject(doc, type_val);
+			StartTypeObject(avro_type_str);
 			auto &struct_children = StructType::GetChildTypes(type);
-			auto fields = yyjson_mut_obj_add_arr(doc, type_val, "fields");
+			writer.Key("fields");
+			writer.StartArray();
 			unordered_map<string, string> field_names;
 			for (auto &it : struct_children) {
 				auto &child_name = it.first;
@@ -282,93 +252,109 @@ public:
 				auto &child_type = it.second;
 				auto child_field_id = GetChildFieldIdByName(field_id, child_name.GetIdentifierName());
 
-				auto struct_field =
-				    CreateStructField(child_name.GetIdentifierName(), child_type, child_field_id, field_names);
-				yyjson_mut_arr_add_val(fields, struct_field);
+				CreateStructField(child_name.GetIdentifierName(), child_type, child_field_id, field_names);
 			}
+			writer.EndArray();
 		} else if (type_id == LogicalTypeId::LIST) {
-			type_val = WrapTypeInObject(doc, type_val);
+			StartTypeObject(avro_type_str);
 
 			auto &list_child = ListType::GetChildType(type);
 			auto element_field_id = GetChildFieldIdByName(field_id, "list");
-			yyjson_mut_val *items_type_val;
+			auto nullable = !element_field_id || element_field_id->nullable;
+			writer.Key("items");
+			if (nullable) {
+				writer.StartArray();
+				writer.String("null");
+			}
 			if (list_child.id() == LogicalTypeId::STRUCT && element_field_id) {
 				auto preset_schema_name = StringUtil::Format("r%d", element_field_id->GetFieldId());
-				items_type_val = CreateJSONType(list_child, element_field_id, preset_schema_name.c_str());
+				CreateJSONType(list_child, element_field_id, preset_schema_name.c_str());
 			} else {
-				items_type_val = CreateJSONType(list_child, element_field_id);
+				CreateJSONType(list_child, element_field_id);
 			}
-
-			if (!element_field_id || element_field_id->nullable) {
-				auto union_array = yyjson_mut_arr(doc);
-				yyjson_mut_arr_add_strcpy(doc, union_array, "null");
-				yyjson_mut_arr_add_val(union_array, items_type_val);
-				items_type_val = union_array;
+			if (nullable) {
+				writer.EndArray();
 			}
-			yyjson_mut_obj_add_val(doc, type_val, "items", items_type_val);
 
 			if (element_field_id) {
-				yyjson_mut_obj_add_int(doc, type_val, "element-id", element_field_id->GetFieldId());
+				writer.Key("element-id");
+				writer.SignedInteger(element_field_id->GetFieldId());
 			}
 		} else if (type_id == LogicalTypeId::MAP) {
-			type_val = WrapTypeInObject(doc, type_val);
+			StartTypeObject(avro_type_str);
 
-			yyjson_mut_obj_add_strcpy(doc, type_val, "logicalType", "map");
+			writer.Key("logicalType");
+			writer.String("map");
 
-			yyjson_mut_val *map_items_val;
 			MapKeyValueIds key_value_ids;
 			auto &list_child = ListType::GetChildType(type);
 			D_ASSERT(list_child.id() == LogicalTypeId::STRUCT);
 
+			writer.Key("items");
 			if (!GetMapKeyValueIds(field_id, key_value_ids)) {
-				map_items_val = CreateJSONType(list_child, field_id);
+				CreateJSONType(list_child, field_id);
 			} else {
 				auto preset_schema_name = StringUtil::Format("k%d_v%d", key_value_ids.key_id, key_value_ids.value_id);
-				map_items_val = CreateJSONType(list_child, field_id, preset_schema_name.c_str());
+				CreateJSONType(list_child, field_id, preset_schema_name.c_str());
 			}
-			yyjson_mut_obj_add_val(doc, type_val, "items", map_items_val);
 		} else if (type.IsTemporal()) {
-			type_val = WrapTypeInObject(doc, type_val);
-			yyjson_mut_obj_add_strcpy(doc, type_val, "logicalType", GetTemporalLogicalType(type).c_str());
+			StartTypeObject(avro_type_str);
+			writer.Key("logicalType");
+			writer.String(GetTemporalLogicalType(type));
 			if (type == LogicalTypeId::TIMESTAMP_TZ) {
-				yyjson_mut_obj_add_bool(doc, type_val, "adjust-to-utc", true);
+				writer.Key("adjust-to-utc");
+				writer.Boolean(true);
 			}
 		} else if (type_id == LogicalTypeId::DECIMAL) {
-			type_val = WrapTypeInObject(doc, type_val);
+			StartTypeObject(avro_type_str);
 			auto scale = DecimalType::GetScale(type);
 			auto width = DecimalType::GetWidth(type);
-			yyjson_mut_obj_add_strcpy(doc, type_val, "logicalType", "decimal");
-			yyjson_mut_obj_add_uint(doc, type_val, "scale", scale);
-			yyjson_mut_obj_add_uint(doc, type_val, "precision", width);
-			yyjson_mut_obj_add_uint(doc, type_val, "size", MinBytesRequiredForDecimal(width));
+			writer.Key("logicalType");
+			writer.String("decimal");
+			writer.Key("scale");
+			writer.UnsignedInteger(scale);
+			writer.Key("precision");
+			writer.UnsignedInteger(width);
+			writer.Key("size");
+			writer.UnsignedInteger(MinBytesRequiredForDecimal(width));
 		} else if (type_id == LogicalTypeId::UUID) {
-			type_val = WrapTypeInObject(doc, type_val);
-			yyjson_mut_obj_add_strcpy(doc, type_val, "logicalType", "uuid");
-			yyjson_mut_obj_add_uint(doc, type_val, "size", 16);
+			StartTypeObject(avro_type_str);
+			writer.Key("logicalType");
+			writer.String("uuid");
+			writer.Key("size");
+			writer.UnsignedInteger(16);
 		} else if (type.IsNested()) {
 			throw NotImplementedException("Can't convert nested type '%s' to Avro", type.ToString());
+		} else {
+			writer.String(avro_type_str);
+			return;
 		}
 
 		if (IsNamedSchema(type)) {
-			D_ASSERT(IsJSONObject(type_val));
 			if (preset_schema_name) {
 				VerifyAvroName(preset_schema_name);
 				VerifyNamedSchemaUniqueness(preset_schema_name);
-				yyjson_mut_obj_add_strcpy(doc, type_val, "name", preset_schema_name);
+				writer.Key("name");
+				writer.String(preset_schema_name);
 			} else {
 				auto named_schema = GenerateSchemaName(avro_type_str);
-				yyjson_mut_obj_add_strcpy(doc, type_val, "name", named_schema.c_str());
+				writer.Key("name");
+				writer.String(named_schema);
 			}
 		}
-		return type_val;
+		writer.EndObject();
 	}
 
 	string GenerateJSON() {
 		VerifyAvroName(root_name);
 		VerifyNamedSchemaUniqueness(root_name);
-		yyjson_mut_obj_add_str(doc, root_object, "type", "record");
-		yyjson_mut_obj_add_strcpy(doc, root_object, "name", root_name.c_str());
-		auto array = yyjson_mut_obj_add_arr(doc, root_object, "fields");
+		writer.StartObject();
+		writer.Key("type");
+		writer.String("record");
+		writer.Key("name");
+		writer.String(root_name);
+		writer.Key("fields");
+		writer.StartArray();
 
 		unordered_map<string, string> field_names;
 		//! Add all the fields
@@ -382,18 +368,13 @@ public:
 			if (it != children.end()) {
 				field_id = it->second;
 			}
-			yyjson_mut_arr_add_val(array, CreateStructField(name, type, field_id, field_names));
+			CreateStructField(name, type, field_id, field_names);
 		}
+		writer.EndArray();
+		writer.EndObject();
 
 		//! Write the result to a string
-		auto data = yyjson_mut_val_write_opts(root_object, YYJSON_WRITE_ALLOW_INF_AND_NAN, nullptr, nullptr, nullptr);
-		if (!data) {
-			yyjson_mut_doc_free(doc);
-			throw InvalidInputException("Could not create a JSON representation of the table schema, yyjson failed");
-		}
-		auto res = string(data);
-		free(data);
-		return res;
+		return writer.ToString();
 	}
 
 private:
@@ -437,27 +418,31 @@ private:
 		return result;
 	}
 
-	yyjson_mut_val *CreateStructField(const string &name, const LogicalType &type, optional_ptr<avro::FieldID> field_id,
-	                                  unordered_map<string, string> &field_names) {
+	void CreateStructField(const string &name, const LogicalType &type, optional_ptr<avro::FieldID> field_id,
+	                       unordered_map<string, string> &field_names) {
 		auto output_name = SanitizeFieldName(name, field_names);
-		auto struct_field = yyjson_mut_obj(doc);
 		auto schema_name = output_name;
 		if (type.id() == LogicalTypeId::STRUCT && field_id) {
 			schema_name = StringUtil::Format("r%d", field_id->GetFieldId());
 		}
-		auto struct_field_type = CreateJSONType(type, field_id, schema_name.c_str());
-		if (!field_id || field_id->nullable) {
-			auto union_array = yyjson_mut_arr(doc);
-			yyjson_mut_arr_add_strcpy(doc, union_array, "null");
-			yyjson_mut_arr_add_val(union_array, struct_field_type);
-			struct_field_type = union_array;
+		auto nullable = !field_id || field_id->nullable;
+		writer.StartObject();
+		writer.Key("type");
+		if (nullable) {
+			writer.StartArray();
+			writer.String("null");
 		}
-		yyjson_mut_obj_add_val(doc, struct_field, "type", struct_field_type);
+		CreateJSONType(type, field_id, schema_name.c_str());
+		if (nullable) {
+			writer.EndArray();
+		}
 		if (field_id) {
-			yyjson_mut_obj_add_uint(doc, struct_field, "field-id", field_id->GetFieldId());
+			writer.Key("field-id");
+			writer.UnsignedInteger(field_id->GetFieldId());
 		}
-		yyjson_mut_obj_add_strcpy(doc, struct_field, "name", output_name.c_str());
-		return struct_field;
+		writer.Key("name");
+		writer.String(output_name.c_str());
+		writer.EndObject();
 	}
 
 	optional_ptr<avro::FieldID> GetChildFieldIdByName(optional_ptr<avro::FieldID> parent, const string &name) {
@@ -495,8 +480,7 @@ public:
 	string root_name = "root";
 	avro::ChildFieldIDs field_ids;
 	idx_t generated_name_id = 0;
-	yyjson_mut_doc *doc = nullptr;
-	yyjson_mut_val *root_object;
+	JSONStringWriter writer;
 	unordered_set<string> named_schemas;
 };
 
@@ -507,7 +491,11 @@ static string CreateJSONSchema(const identifier_map_t<vector<Value>> &options, c
 	state.ParseFieldIds(options, recognized);
 	state.ParseRootName(options, recognized);
 	state.ParseSanitizeFieldNames(options, recognized);
-	return state.GenerateJSON();
+	try {
+		return state.GenerateJSON();
+	} catch (SerializationException &) {
+		throw InvalidInputException("Could not create a JSON representation of the table schema");
+	}
 }
 
 static string CreateJSONMetadata(const identifier_map_t<vector<Value>> &options, identifier_set_t &recognized) {
@@ -534,25 +522,22 @@ static string CreateJSONMetadata(const identifier_map_t<vector<Value>> &options,
 		metadata[child_name.GetIdentifierName()] = child.ToString();
 	}
 
-	std::unique_ptr<yyjson_mut_doc, YyjsonDocDeleter> doc_p(yyjson_mut_doc_new(nullptr));
-	auto doc = doc_p.get();
-	yyjson_mut_val *root_object = yyjson_mut_obj(doc);
-	yyjson_mut_doc_set_root(doc, root_object);
-
-	for (auto &item : metadata) {
-		auto &key = item.first;
-		auto &value = item.second;
-		yyjson_mut_obj_add_strcpy(doc, root_object, key.c_str(), value.c_str());
+	JSONStringWriter writer(JSONWriteFlags::ALLOW_INF_AND_NAN);
+	try {
+		writer.StartObject();
+		for (auto &item : metadata) {
+			auto &key = item.first;
+			auto &value = item.second;
+			writer.Key(key.c_str());
+			writer.String(value.c_str());
+		}
+		writer.EndObject();
+	} catch (SerializationException &) {
+		throw InvalidInputException("Could not create a JSON representation of the metadata");
 	}
 
 	//! Write the result to a string
-	auto data = yyjson_mut_val_write_opts(root_object, YYJSON_WRITE_ALLOW_INF_AND_NAN, nullptr, nullptr, nullptr);
-	if (!data) {
-		throw InvalidInputException("Could not create a JSON representation of the metadata, yyjson failed");
-	}
-	auto res = string(data);
-	free(data);
-	return res;
+	return writer.ToString();
 }
 
 //! Parse the CODEC option (Avro object-container compression codec). Validates the value is a
