@@ -1,0 +1,107 @@
+# name: test/sql/copy/parallel.test
+# description: COPY ... TO (FORMAT AVRO) from many threads: in parallel, in ordered batches, from one thread, and into rotated or partitioned files
+# group: [copy]
+
+require avro
+
+statement ok
+SET threads=8;
+
+statement ok
+CREATE TABLE src AS SELECT
+	i,
+	'value_' || i AS s,
+	CASE WHEN i % 7 = 0 THEN NULL ELSE range(i % 5) END AS l,
+	CASE WHEN i % 11 = 0 THEN NULL ELSE {'a': i * 2, 'b': CASE WHEN i % 3 = 0 THEN NULL ELSE 'b' || i END, 'c': [i, NULL]} END AS st
+FROM range(300000) t(i);
+
+# Without insertion order every thread appends its own blocks to the file.
+statement ok
+SET preserve_insertion_order=false;
+
+statement ok
+COPY src TO '{TEST_DIR}/parallel_unordered.avro' (FORMAT AVRO, CODEC 'zstandard');
+
+query IIIII
+SELECT count(*), sum(i), sum(len(l)), sum(st.a), count(st.b) FROM read_avro('{TEST_DIR}/parallel_unordered.avro');
+----
+300000	44999850000	514284	81818018184	181818
+
+query I
+SELECT count(*) FROM (SELECT * FROM src EXCEPT SELECT * FROM read_avro('{TEST_DIR}/parallel_unordered.avro'));
+----
+0
+
+# With insertion order the batches are encoded in parallel and appended in order.
+statement ok
+SET preserve_insertion_order=true;
+
+statement ok
+COPY src TO '{TEST_DIR}/parallel_ordered.avro' (FORMAT AVRO, CODEC 'deflate');
+
+query IIIII
+SELECT count(*), sum(i), sum(len(l)), sum(st.a), count(st.b) FROM read_avro('{TEST_DIR}/parallel_ordered.avro');
+----
+300000	44999850000	514284	81818018184	181818
+
+query I
+SELECT count(*) FROM (SELECT * FROM src EXCEPT SELECT * FROM read_avro('{TEST_DIR}/parallel_ordered.avro'));
+----
+0
+
+# Rotated files: every batch is encoded once and may be appended to a later file than the first.
+statement ok
+COPY src TO '{TEST_DIR}/rotated' (FORMAT AVRO, FILE_SIZE_BYTES '1MB');
+
+query I
+SELECT count(*) > 1 FROM glob('{TEST_DIR}/rotated/*.avro');
+----
+true
+
+query IIIII
+SELECT count(*), sum(i), sum(len(l)), sum(st.a), count(st.b) FROM read_avro('{TEST_DIR}/rotated/*.avro');
+----
+300000	44999850000	514284	81818018184	181818
+
+query I
+SELECT count(*) FROM (SELECT * FROM src EXCEPT SELECT * FROM read_avro('{TEST_DIR}/rotated/*.avro'));
+----
+0
+
+statement ok
+COPY (SELECT i % 4 AS p, * FROM src) TO '{TEST_DIR}/partitioned' (FORMAT AVRO, PARTITION_BY (p), CODEC 'snappy');
+
+query IIIII
+SELECT count(*), sum(i), sum(len(l)), sum(st.a), count(st.b) FROM read_avro('{TEST_DIR}/partitioned/*/*.avro');
+----
+300000	44999850000	514284	81818018184	181818
+
+query I
+SELECT count(*) FROM (SELECT i, s, l, st FROM src EXCEPT SELECT i, s, l, st FROM read_avro('{TEST_DIR}/partitioned/*/*.avro'));
+----
+0
+
+# One thread appends a block whenever its buffer fills.
+statement ok
+SET threads=1;
+
+statement ok
+COPY src TO '{TEST_DIR}/single_thread.avro' (FORMAT AVRO);
+
+query I
+SELECT count(*) FROM (SELECT * FROM src EXCEPT SELECT * FROM read_avro('{TEST_DIR}/single_thread.avro'));
+----
+0
+
+# Ordered writes keep the rows in insertion order.
+query I nosort ordered
+SELECT i FROM src ORDER BY i;
+----
+
+query I nosort ordered
+SELECT i FROM read_avro('{TEST_DIR}/parallel_ordered.avro');
+----
+
+query I nosort ordered
+SELECT i FROM read_avro('{TEST_DIR}/single_thread.avro');
+----

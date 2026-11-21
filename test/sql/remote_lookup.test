@@ -1,0 +1,53 @@
+# name: test/sql/remote_lookup.test
+# description: a Top-N over an Avro file read over HTTP looks the rows it keeps up by their block and record
+# group: [sql]
+
+require avro
+
+require httpfs
+
+require-env PYTHON_HTTP_SERVER_URL
+
+require-env PYTHON_HTTP_SERVER_DIR
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+SET threads=4
+
+foreach codec null deflate snappy zstandard
+
+statement ok
+COPY (SELECT i AS id, 'value_' || i AS s, CASE WHEN i % 10 = 0 THEN NULL ELSE [i, i + 1] END AS l, {'a': i % 3, 'b': 'x' || (i % 5)} AS r FROM range(100000) t(i)) TO '{PYTHON_HTTP_SERVER_DIR}/lookup_${codec}.avro' (FORMAT avro, CODEC '${codec}');
+
+query II
+EXPLAIN SELECT * FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_${codec}.avro') ORDER BY id DESC LIMIT 3
+----
+physical_plan	<REGEX>:.*LOOKUP_JOIN.*
+
+query IIII
+SELECT * FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_${codec}.avro') ORDER BY id DESC LIMIT 3
+----
+99999	value_99999	[99999, 100000]	{'a': 0, 'b': x4}
+99998	value_99998	[99998, 99999]	{'a': 2, 'b': x3}
+99997	value_99997	[99997, 99998]	{'a': 1, 'b': x2}
+
+query IIII
+SELECT * FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_${codec}.avro') ORDER BY id LIMIT 2 OFFSET 50000
+----
+50000	value_50000	NULL	{'a': 2, 'b': x0}
+50001	value_50001	[50001, 50002]	{'a': 0, 'b': x1}
+
+query III
+SELECT count(*), sum(id), count(DISTINCT s) FROM (SELECT * FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_${codec}.avro') ORDER BY s LIMIT 5000)
+----
+5000	<REGEX>:\d+	5000
+
+query II
+SELECT id, s FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_${codec}.avro') WHERE id % 1000 = 7 ORDER BY id DESC LIMIT 2
+----
+99007	value_99007
+98007	value_98007
+
+endloop
