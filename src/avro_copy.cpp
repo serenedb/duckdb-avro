@@ -378,7 +378,7 @@ private:
 	}
 
 	static void ApplyFieldId(AvroWriteSchema &schema, optional_ptr<avro::FieldID> field_id) {
-		schema.nullable = !field_id || field_id->nullable;
+		schema.nullable = schema.type.id() != LogicalTypeId::SQLNULL && (!field_id || field_id->nullable);
 		if (HasId(field_id)) {
 			schema.has_field_id = true;
 			schema.field_id = field_id->GetFieldId();

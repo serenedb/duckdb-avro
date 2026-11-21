@@ -272,3 +272,17 @@ COPY (SELECT * FROM (VALUES (1, NULL), (NULL, 'x')) t(a, b)) TO '{TEST_DIR}/null
 );
 ----
 Cannot insert NULL to non-nullable field of type VARCHAR
+
+# a column or nested value of type NULL is written as the null schema itself: a union may hold null only once
+statement ok
+COPY (SELECT NULL AS x, 1 AS y, [NULL, NULL] AS l, {'n': NULL, 'v': 2} AS s) TO '{TEST_DIR}/null_typed.avro';
+
+query I
+SELECT value FROM avro_metadata('{TEST_DIR}/null_typed.avro') WHERE key = 'avro.schema';
+----
+{"type":"record","name":"root","fields":[{"name":"x","type":"null"},{"name":"y","type":["null","int"]},{"name":"l","type":["null",{"type":"array","items":"null"}]},{"name":"s","type":["null",{"type":"record","name":"s","fields":[{"name":"n","type":"null"},{"name":"v","type":["null","int"]}]}]}]}
+
+query IIII
+SELECT * FROM read_avro('{TEST_DIR}/null_typed.avro');
+----
+NULL	1	[NULL, NULL]	{'n': NULL, 'v': 2}
