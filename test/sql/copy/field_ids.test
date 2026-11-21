@@ -96,3 +96,25 @@ COPY (
 	},
 	ROOT_NAME 'manifest_file'
 );
+
+# a struct entry may give ids only to its children: the struct field itself then has no field-id
+statement ok
+COPY (SELECT {'a': 42, 'b': 'x'} AS s) TO '{TEST_DIR}/field_ids_children_only.avro' (FIELD_IDS {'s': {'a': 1}});
+
+query I
+SELECT regexp_extract_all(value, '"field-id":([0-9]+)', 1) FROM avro_metadata('{TEST_DIR}/field_ids_children_only.avro') WHERE key = 'avro.schema';
+----
+[1]
+
+query I
+SELECT s FROM read_avro('{TEST_DIR}/field_ids_children_only.avro');
+----
+{'a': 42, 'b': x}
+
+statement ok
+COPY (SELECT [{'a': 1}] AS l, MAP {'k': 2} AS m) TO '{TEST_DIR}/field_ids_children_only_nested.avro' (FIELD_IDS {'l': {'list': {'a': 3}}, 'm': {'key': 4}});
+
+query II
+SELECT l, m FROM read_avro('{TEST_DIR}/field_ids_children_only_nested.avro');
+----
+[{'a': 1}]	{k=2}
