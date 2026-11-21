@@ -1,0 +1,39 @@
+# name: test/sql/reader/named_types.test
+# description: read_avro resolves records, enums and fixed referenced by short and full names across namespaces
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/named_types.avro'))
+----
+id	INTEGER
+p1	STRUCT(x INTEGER, y INTEGER)
+p2	STRUCT(x INTEGER, y INTEGER)
+p3	STRUCT(x INTEGER, y INTEGER)
+other	STRUCT(p STRUCT(x INTEGER, y INTEGER), q STRUCT(word VARCHAR), r STRUCT(word VARCHAR), suit ENUM('SPADES', 'HEARTS'), suit2 ENUM('SPADES', 'HEARTS'))
+p4	STRUCT(x INTEGER, y INTEGER)
+q2	STRUCT(word VARCHAR)
+suit3	ENUM('SPADES', 'HEARTS')
+h1	BLOB
+h2	BLOB
+h3	BLOB
+dotted	STRUCT(v BIGINT)
+dotted2	STRUCT(v BIGINT)
+points	STRUCT(x INTEGER, y INTEGER)[]
+maybe	UNION(u1 STRUCT(x INTEGER, y INTEGER), u2 STRUCT(word VARCHAR))
+by_key	MAP(VARCHAR, ENUM('SPADES', 'HEARTS'))
+
+query IIIIIIIIIIIIIIII
+SELECT * FROM read_avro('test/reader/named_types.avro') ORDER BY id
+----
+0	{'x': 1, 'y': 2}	{'x': 3, 'y': 4}	{'x': 5, 'y': 6}	{'p': {'x': 7, 'y': 8}, 'q': {'word': q}, 'r': {'word': r}, 'suit': SPADES, 'suit2': HEARTS}	{'x': 9, 'y': 10}	{'word': q2}	HEARTS	\xDE\xAD\xBE\xEF	\x00\x01\x02\x03	abcd	{'v': 11}	{'v': 12}	[{'x': 13, 'y': 14}, {'x': 15, 'y': 16}]	{'x': 17, 'y': 18}	{a=SPADES, b=HEARTS}
+1	{'x': -1, 'y': -2}	{'x': -3, 'y': -4}	{'x': -5, 'y': -6}	{'p': {'x': -7, 'y': -8}, 'q': {'word': qq}, 'r': {'word': rr}, 'suit': HEARTS, 'suit2': SPADES}	{'x': -9, 'y': -10}	{'word': qq2}	SPADES	\xFF\xFF\xFF\xFF	wxyz	\x00\x00\x00\x00	{'v': -11}	{'v': -12}	[]	{'word': other point}	{}
+2	{'x': 0, 'y': 0}	{'x': 0, 'y': 0}	{'x': 0, 'y': 0}	{'p': {'x': 0, 'y': 0}, 'q': {'word': ''}, 'r': {'word': ''}, 'suit': SPADES, 'suit2': SPADES}	{'x': 0, 'y': 0}	{'word': ''}	HEARTS	1234	5678	9abc	{'v': 0}	{'v': 0}	[{'x': 0, 'y': 0}]	NULL	{c=HEARTS}
+
+query II
+SELECT id, union_tag(maybe) FROM read_avro('test/reader/named_types.avro') ORDER BY id
+----
+0	u1
+1	u2
+2	NULL

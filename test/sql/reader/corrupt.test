@@ -1,0 +1,45 @@
+# name: test/sql/reader/corrupt.test
+# description: read_avro fails on a truncated block, a wrong sync marker, invalid UTF-8 and enum or union indexes out of range
+# group: [reader]
+
+require avro
+
+statement error
+SELECT * FROM read_avro('test/reader/corrupt_truncated.avro')
+----
+truncated
+
+statement error
+SELECT * FROM read_avro('test/reader/corrupt_sync_marker.avro')
+----
+sync marker
+
+statement error
+SELECT * FROM read_avro('test/reader/corrupt_utf8.avro')
+----
+UTF-8
+
+statement error
+SELECT * FROM read_avro('test/reader/corrupt_enum.avro')
+----
+enum index
+
+statement error
+SELECT * FROM read_avro('test/reader/corrupt_enum_negative.avro')
+----
+enum index
+
+statement error
+SELECT * FROM read_avro('test/reader/corrupt_union.avro')
+----
+union branch
+
+statement error
+SELECT * FROM read_avro('test/reader/corrupt_union_nullable.avro')
+----
+union branch
+
+statement error
+SELECT * FROM read_avro('test/reader/corrupt_union_negative.avro')
+----
+union branch

@@ -1,0 +1,34 @@
+# name: test/sql/reader/range_split.test
+# description: read_avro splits a file into byte ranges by sync marker - a block much larger than a range belongs to the range it starts in, and a sync marker inside a block's data does not start a block
+# group: [reader]
+
+require avro
+
+statement ok
+SET threads=16
+
+query IIII
+SELECT count(*), sum(id), sum(octet_length(payload)), count(DISTINCT id) FROM read_avro('test/reader/big_block.avro')
+----
+200000	19999900000	3900000	200000
+
+query I
+SELECT count(*) FROM read_avro('test/reader/big_block.avro')
+----
+200000
+
+# every record's payload carries the file's sync marker
+query IIII
+SELECT count(*), sum(id), sum(octet_length(payload)), count(DISTINCT id) FROM read_avro('test/reader/false_sync.avro')
+----
+60000	1799970000	2490000	60000
+
+query I
+SELECT count(*) FROM read_avro('test/reader/false_sync.avro')
+----
+60000
+
+query II
+SELECT count(*), sum(id) FROM read_avro('test/reader/false_sync.avro') WHERE id % 1000 = 999
+----
+60	1829940

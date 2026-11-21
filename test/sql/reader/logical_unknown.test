@@ -1,0 +1,20 @@
+# name: test/sql/reader/logical_unknown.test
+# description: read_avro reads a logical type it does not know as the underlying Avro type
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/logical_unknown.avro'))
+----
+id	INTEGER
+my_long	BIGINT
+my_string	VARCHAR
+my_fixed	BLOB
+
+query IIII
+SELECT * FROM read_avro('test/reader/logical_unknown.avro') ORDER BY id
+----
+0	0	a	abcd
+1	-9223372036854775808	NULL	\x00\x01\x02\x03
+2	9223372036854775807	z	\xFF\xFF\xFF\xFF

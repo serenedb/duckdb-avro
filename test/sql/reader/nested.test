@@ -1,0 +1,31 @@
+# name: test/sql/reader/nested.test
+# description: read_avro reads records nested three deep, arrays of arrays, maps of records and maps with array values
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/nested.avro'))
+----
+id	INTEGER
+level1	STRUCT(a INTEGER, level2 STRUCT(b VARCHAR, level3 STRUCT(c BIGINT, d VARCHAR)))
+matrix	INTEGER[][]
+words	VARCHAR[][]
+recs	MAP(VARCHAR, STRUCT(x INTEGER, s VARCHAR))
+lists	MAP(VARCHAR, BIGINT[])
+maps	MAP(VARCHAR, INTEGER)[]
+structs	STRUCT(c BIGINT, d VARCHAR)[]
+
+query IIIIIIII
+SELECT * FROM read_avro('test/reader/nested.avro') ORDER BY id
+----
+0	{'a': 1, 'level2': {'b': x, 'level3': {'c': 10, 'd': NULL}}}	[[1, 2], [], [3]]	[[a, b], []]	{k1={'x': 1, 's': one}, k2={'x': 2, 's': two}}	{a=[1, 2], b=[]}	[{x=1}, {}]	[{'c': 1, 'd': p}]
+1	{'a': -1, 'level2': {'b': '', 'level3': {'c': -10, 'd': deep}}}	[]	[[]]	{}	{}	[]	[]
+2	{'a': 2147483647, 'level2': {'b': abcdefghijklmnopqrstuvwxyz, 'level3': {'c': -9223372036854775808, 'd': z}}}	[[]]	[[abcdefghijklmnopqrstuvwxyz], [c]]	{k={'x': -3, 's': three}}	{c=[9223372036854775807, -9223372036854775808]}	[{y=2, z=3}]	[{'c': 2, 'd': NULL}, {'c': 3, 'd': q}]
+
+query IIIIIII
+SELECT id, level1.level2.level3.c, matrix[1][2], recs['k2'].s, lists['a'][2], maps[1]['x'], structs[1].d FROM read_avro('test/reader/nested.avro') ORDER BY id
+----
+0	10	2	two	2	1	p
+1	-10	NULL	NULL	NULL	NULL	NULL
+2	-9223372036854775808	NULL	NULL	NULL	NULL	NULL
