@@ -6,4 +6,4 @@ require avro
 statement error
 COPY (select range(10000) AS "range(10000)") TO '{TEST_DIR}/tmp.avro';
 ----
-Invalid Avro identifier
+Invalid Avro identifier "range(10000)": field names have to match the regex [A-Za-z_][A-Za-z0-9_]*, or set SANITIZE_FIELD_NAMES

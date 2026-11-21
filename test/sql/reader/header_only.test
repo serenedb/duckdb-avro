@@ -1,0 +1,20 @@
+# name: test/sql/reader/header_only.test
+# description: read_avro reads a file without blocks, only its header, as its schema and no rows
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/header_only.avro'))
+----
+id	BIGINT
+word	VARCHAR
+
+query I
+SELECT count(*) FROM read_avro('test/reader/header_only.avro')
+----
+0
+
+query II
+SELECT * FROM read_avro('test/reader/header_only.avro')
+----

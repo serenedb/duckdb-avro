@@ -211,3 +211,78 @@ COPY (select
 	},
 	ROOT_NAME 'manifest_file'
 );
+
+# a NULL struct writes no fields, so its non-nullable fields are not checked
+statement ok
+COPY (
+	SELECT i AS id, CASE WHEN i % 2 = 0 THEN NULL ELSE {'content': i::INTEGER} END AS data_file FROM range(4) t(i)
+) TO '{TEST_DIR}/null_struct_required_field.avro' (
+	FIELD_IDS {
+		'data_file': {
+			'__duckdb_field_id': 1,
+			'content': {'__duckdb_field_id': 2, '__duckdb_nullable': false}
+		}
+	},
+	ROOT_NAME 'manifest_entry'
+);
+
+query III
+SELECT id, data_file IS NULL, data_file.content FROM read_avro('{TEST_DIR}/null_struct_required_field.avro') ORDER BY id;
+----
+0	true	NULL
+1	false	1
+2	true	NULL
+3	false	3
+
+# a NULL list writes no elements, so its non-nullable elements are not checked
+statement ok
+COPY (
+	SELECT i AS id, CASE WHEN i % 2 = 0 THEN NULL ELSE [i::INTEGER, i::INTEGER + 1] END AS l FROM range(4) t(i)
+) TO '{TEST_DIR}/null_list_required_element.avro' (
+	FIELD_IDS {
+		'l': {'__duckdb_field_id': 1, 'list': {'__duckdb_field_id': 2, '__duckdb_nullable': false}}
+	}
+);
+
+query II
+SELECT id, l FROM read_avro('{TEST_DIR}/null_list_required_element.avro') ORDER BY id;
+----
+0	NULL
+1	[1, 2]
+2	NULL
+3	[3, 4]
+
+# a NULL element of a list that is written is rejected
+statement error
+COPY (SELECT [1, NULL]::INTEGER[] AS l) TO '{TEST_DIR}/null_required_element.avro' (
+	FIELD_IDS {
+		'l': {'__duckdb_field_id': 1, 'list': {'__duckdb_field_id': 2, '__duckdb_nullable': false}}
+	}
+);
+----
+Cannot insert NULL to non-nullable field of type INTEGER
+
+# the first row holding a rejected NULL names the error, then the first such column in it
+statement error
+COPY (SELECT * FROM (VALUES (1, NULL), (NULL, 'x')) t(a, b)) TO '{TEST_DIR}/null_first_row.avro' (
+	FIELD_IDS {
+		'a': {'__duckdb_field_id': 1, '__duckdb_nullable': false},
+		'b': {'__duckdb_field_id': 2, '__duckdb_nullable': false}
+	}
+);
+----
+Cannot insert NULL to non-nullable field of type VARCHAR
+
+# a column or nested value of type NULL is written as the null schema itself: a union may hold null only once
+statement ok
+COPY (SELECT NULL AS x, 1 AS y, [NULL, NULL] AS l, {'n': NULL, 'v': 2} AS s) TO '{TEST_DIR}/null_typed.avro';
+
+query I
+SELECT value FROM avro_metadata('{TEST_DIR}/null_typed.avro') WHERE key = 'avro.schema';
+----
+{"type":"record","name":"root","fields":[{"name":"x","type":"null"},{"name":"y","type":["null","int"]},{"name":"l","type":["null",{"type":"array","items":"null"}]},{"name":"s","type":["null",{"type":"record","name":"s","fields":[{"name":"n","type":"null"},{"name":"v","type":["null","int"]}]}]}]}
+
+query IIII
+SELECT * FROM read_avro('{TEST_DIR}/null_typed.avro');
+----
+NULL	1	[NULL, NULL]	{'n': NULL, 'v': 2}

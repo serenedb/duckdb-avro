@@ -1,51 +1,55 @@
 # name: test/sql/copy/codec.test
-# description: COPY ... TO (FORMAT AVRO, CODEC '...') writes a natively-compressed Avro object
+# description: COPY ... TO (FORMAT AVRO, CODEC '...') compresses every block with the codec and round-trips
 # group: [copy]
-
-#              container (codec applied by avro-c, no post-processing). Round-trips correctly.
-#              The set of accepted codecs follows whatever avro-c was built with.
 
 require avro
 
-# Default (no CODEC) writes uncompressed and round-trips.
 statement ok
-COPY (select i a, ('row_' || (i % 4)::VARCHAR) b from range(2000) t(i)) TO '{TEST_DIR}/codec_none.avro' (FORMAT AVRO);
+CREATE TABLE src AS SELECT
+	i AS a,
+	'row_' || (i % 4)::VARCHAR AS b,
+	CASE WHEN i % 3 = 0 THEN NULL ELSE [i, NULL, i + 1] END AS c,
+	{'x': i % 7, 'y': repeat('y', i % 50)} AS d
+FROM range(20000) t(i);
 
-# Explicit null codec is accepted and round-trips.
+# The default (no CODEC) writes uncompressed blocks.
 statement ok
-COPY (select i a, ('row_' || (i % 4)::VARCHAR) b from range(2000) t(i)) TO '{TEST_DIR}/codec_null.avro' (FORMAT AVRO, CODEC 'null');
+COPY src TO '{TEST_DIR}/codec_default.avro' (FORMAT AVRO);
 
-# deflate codec: native compression.
-statement ok
-COPY (select i a, ('row_' || (i % 4)::VARCHAR) b from range(2000) t(i)) TO '{TEST_DIR}/codec_deflate.avro' (FORMAT AVRO, CODEC 'deflate');
-
-# snappy codec.
-statement ok
-COPY (select i a, ('row_' || (i % 4)::VARCHAR) b from range(2000) t(i)) TO '{TEST_DIR}/codec_snappy.avro' (FORMAT AVRO, CODEC 'snappy');
-
-# Every codec round-trips to the identical row set and count.
-query II
-select count(*), sum(a) from read_avro('{TEST_DIR}/codec_deflate.avro');
-----
-2000	1999000
-
-query II
-select count(*), sum(a) from read_avro('{TEST_DIR}/codec_snappy.avro');
-----
-2000	1999000
-
-query II
-select count(*), sum(a) from read_avro('{TEST_DIR}/codec_null.avro');
-----
-2000	1999000
-
-# Compressed output equals the uncompressed output row-for-row (codec is transparent on read).
 query I
-select count(*) from (
-	select a, b from read_avro('{TEST_DIR}/codec_deflate.avro')
-	except
-	select a, b from read_avro('{TEST_DIR}/codec_none.avro')
-);
+SELECT value FROM avro_metadata('{TEST_DIR}/codec_default.avro') WHERE key = 'avro.codec';
+----
+null
+
+foreach codec null deflate snappy zstandard
+
+statement ok
+COPY src TO '{TEST_DIR}/codec_{codec}.avro' (FORMAT AVRO, CODEC '{codec}');
+
+query I
+SELECT value = '{codec}' FROM avro_metadata('{TEST_DIR}/codec_{codec}.avro') WHERE key = 'avro.codec';
+----
+true
+
+query III
+SELECT count(*), sum(a), sum(len(c)) FROM read_avro('{TEST_DIR}/codec_{codec}.avro');
+----
+20000	199990000	39999
+
+query I
+SELECT count(*) FROM (SELECT * FROM src EXCEPT SELECT * FROM read_avro('{TEST_DIR}/codec_{codec}.avro'));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM read_avro('{TEST_DIR}/codec_{codec}.avro') EXCEPT SELECT * FROM src);
+----
+0
+
+endloop
+
+query I
+SELECT count(*) FROM (SELECT * FROM src EXCEPT SELECT * FROM read_avro('{TEST_DIR}/codec_default.avro'));
 ----
 0
 
@@ -58,13 +62,11 @@ select a from read_avro('{TEST_DIR}/codec_ci.avro');
 ----
 1
 
-# An unknown codec fails with avro-c's clear message (validated against what avro-c was built with).
 statement error
 COPY (select 1 a) TO '{TEST_DIR}/codec_bad.avro' (FORMAT AVRO, CODEC 'nope');
 ----
 Unknown codec
 
-# CODEC without a value fails.
 statement error
 COPY (select 1 a) TO '{TEST_DIR}/codec_empty.avro' (FORMAT AVRO, CODEC);
 ----

@@ -1,0 +1,29 @@
+# name: test/sql/reader/logical_uuid.test
+# description: read_avro reads uuid on string and on fixed(16) as UUID, including the values around the sign bit
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/logical_uuid.avro'))
+----
+id	INTEGER
+u_str	UUID
+u_fix	UUID
+
+query III
+SELECT * FROM read_avro('test/reader/logical_uuid.avro') ORDER BY id
+----
+0	00000000-0000-0000-0000-000000000000	00000000-0000-0000-0000-000000000000
+1	00000000-0000-0000-0000-000000000001	00000000-0000-0000-0000-000000000001
+2	7fffffff-ffff-ffff-ffff-ffffffffffff	7fffffff-ffff-ffff-ffff-ffffffffffff
+3	80000000-0000-0000-0000-000000000000	80000000-0000-0000-0000-000000000000
+4	ffffffff-ffff-ffff-ffff-ffffffffffff	ffffffff-ffff-ffff-ffff-ffffffffffff
+5	550e8400-e29b-41d4-a716-446655440000	550e8400-e29b-41d4-a716-446655440000
+6	123e4567-e89b-12d3-a456-426614174000	123e4567-e89b-12d3-a456-426614174000
+7	NULL	NULL
+
+query I
+SELECT list(id ORDER BY u_fix) FROM read_avro('test/reader/logical_uuid.avro') WHERE u_fix = u_str
+----
+[0, 1, 6, 5, 2, 3, 4]

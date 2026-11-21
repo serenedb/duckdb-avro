@@ -1,0 +1,37 @@
+# name: test/sql/copy/large_row.test
+# description: COPY ... TO (FORMAT AVRO) writes rows larger than a block, each in a block of its own
+# group: [copy]
+
+require avro
+
+statement ok
+CREATE TABLE src AS SELECT
+	i,
+	CASE WHEN i % 50 = 7 THEN repeat('x', 300000 + i) ELSE 'small_' || i END AS s,
+	CASE WHEN i = 30 THEN range(100000) ELSE [i] END AS l
+FROM range(100) t(i);
+
+foreach codec null deflate snappy zstandard
+
+statement ok
+COPY src TO '{TEST_DIR}/large_row_{codec}.avro' (FORMAT AVRO, CODEC '{codec}');
+
+query III
+SELECT count(*), sum(length(s)), sum(len(l)) FROM read_avro('{TEST_DIR}/large_row_{codec}.avro');
+----
+100	600839	100099
+
+query I
+SELECT count(*) FROM (SELECT * FROM src EXCEPT SELECT * FROM read_avro('{TEST_DIR}/large_row_{codec}.avro'));
+----
+0
+
+endloop
+
+statement ok
+COPY (SELECT repeat('y', 1000000) AS s) TO '{TEST_DIR}/single_large_row.avro' (FORMAT AVRO);
+
+query II
+SELECT length(s), s = repeat('y', 1000000) FROM read_avro('{TEST_DIR}/single_large_row.avro');
+----
+1000000	true

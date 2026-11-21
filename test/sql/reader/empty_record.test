@@ -1,0 +1,19 @@
+# name: test/sql/reader/empty_record.test
+# description: read_avro reads a record without fields as a "NULL" column, also inside an array, and decodes the fields after it
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/empty_record.avro'))
+----
+id	INTEGER
+empty	"NULL"
+empties	"NULL"[]
+trailer	VARCHAR
+
+query IIII
+SELECT * FROM read_avro('test/reader/empty_record.avro') ORDER BY id
+----
+0	NULL	[]	a
+1	NULL	[NULL, NULL, NULL]	b

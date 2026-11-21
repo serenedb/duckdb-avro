@@ -1,0 +1,22 @@
+# name: test/sql/replacement_scan.test
+# description: a file or glob ending in .avro in FROM reads with read_avro
+# group: [sql]
+
+require avro
+
+query III
+FROM 'test/users.avro'
+----
+Alyssa	256	NULL
+Ben	7	red
+
+query I
+SELECT count(*) FROM 'test/userdata*.avro'
+----
+4998
+
+query II
+SELECT users.name, users.favorite_number FROM 'test/users.avro' AS users ORDER BY ALL
+----
+Alyssa	256
+Ben	7
