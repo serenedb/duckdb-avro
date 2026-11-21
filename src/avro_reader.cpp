@@ -939,12 +939,12 @@ void AvroReader::Load() {
 	cursor = nullptr;
 	block_end = nullptr;
 	if (begin == ranges.start) {
-		window.Start(begin, true, true);
+		window.Start(begin, true);
 		next_block = begin;
 		searching = false;
 		return;
 	}
-	window.Start(begin - AVRO_SYNC_SIZE, true, true);
+	window.Start(begin - AVRO_SYNC_SIZE, true);
 	sync_from = begin - AVRO_SYNC_SIZE;
 	searching = true;
 	if (!FindSync(next_block)) {
