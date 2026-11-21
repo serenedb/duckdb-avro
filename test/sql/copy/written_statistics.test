@@ -15,14 +15,14 @@ require avro
 query IIIIIII
 COPY (SELECT range AS a FROM range(100)) TO '{TEST_DIR}/stats.avro' (FORMAT AVRO, RETURN_STATS);
 ----
-<REGEX>:.*stats\.avro	100	395	NULL	{}	NULL	{}
+<REGEX>:.*stats\.avro	100	386	NULL	{}	NULL	{}
 
 # Regression guard: file_size_bytes must equal the real bytes on disk. Previously the stats were
-# read before the data was flushed, so only the header size (139) was reported.
+# read before the data was flushed, so only the header size (130) was reported.
 query I
 SELECT octet_length(content) FROM read_blob('{TEST_DIR}/stats.avro');
 ----
-395
+386
 
 # The file round-trips to the same row count RETURN_STATS reported.
 query I
@@ -34,12 +34,12 @@ SELECT count(*) FROM read_avro('{TEST_DIR}/stats.avro');
 query IIIIIII
 COPY (SELECT a FROM (SELECT 1 a) WHERE 1 = 0) TO '{TEST_DIR}/empty.avro' (FORMAT AVRO, RETURN_STATS);
 ----
-<REGEX>:.*empty\.avro	0	138	NULL	{}	NULL	{}
+<REGEX>:.*empty\.avro	0	129	NULL	{}	NULL	{}
 
 query I
 SELECT octet_length(content) FROM read_blob('{TEST_DIR}/empty.avro');
 ----
-138
+129
 
 query I
 SELECT count(*) FROM read_avro('{TEST_DIR}/empty.avro');
@@ -48,31 +48,31 @@ SELECT count(*) FROM read_avro('{TEST_DIR}/empty.avro');
 
 # --- Larger input: many blocks --------------------------------------------------------------------
 query IIIIIII
-COPY (SELECT range AS a FROM range(10000)) TO '{TEST_DIR}/big.avro' (FORMAT AVRO, RETURN_STATS);
+COPY (SELECT range AS a FROM range(100000)) TO '{TEST_DIR}/big.avro' (FORMAT AVRO, RETURN_STATS);
 ----
-<REGEX>:.*big\.avro	10000	31983	NULL	{}	NULL	{}
+<REGEX>:.*big\.avro	100000	391918	NULL	{}	NULL	{}
 
 query I
 SELECT octet_length(content) FROM read_blob('{TEST_DIR}/big.avro');
 ----
-31983
+391918
 
 query I
 SELECT count(*) FROM read_avro('{TEST_DIR}/big.avro');
 ----
-10000
+100000
 
 # --- Multiple columns -----------------------------------------------------------------------------
 query IIIIIII
 COPY (SELECT range AS a, range::VARCHAR AS b FROM range(50)) TO '{TEST_DIR}/cols.avro' (FORMAT AVRO, RETURN_STATS);
 ----
-<REGEX>:.*cols\.avro	50	495	NULL	{}	NULL	{}
+<REGEX>:.*cols\.avro	50	477	NULL	{}	NULL	{}
 
 # Reported size equals bytes on disk for the multi-column file too.
 query I
 SELECT octet_length(content) FROM read_blob('{TEST_DIR}/cols.avro');
 ----
-495
+477
 
 query I
 SELECT count(*) FROM read_avro('{TEST_DIR}/cols.avro');
