@@ -372,9 +372,13 @@ private:
 		return result;
 	}
 
+	static bool HasId(optional_ptr<avro::FieldID> field_id) {
+		return field_id && field_id->set;
+	}
+
 	static void ApplyFieldId(AvroWriteSchema &schema, optional_ptr<avro::FieldID> field_id) {
 		schema.nullable = !field_id || field_id->nullable;
-		if (field_id) {
+		if (HasId(field_id)) {
 			schema.has_field_id = true;
 			schema.field_id = field_id->GetFieldId();
 		}
@@ -384,7 +388,7 @@ private:
 	                                  unordered_map<string, string> &field_names) {
 		auto output_name = SanitizeFieldName(name, field_names);
 		auto schema_name = output_name;
-		if (type.id() == LogicalTypeId::STRUCT && field_id) {
+		if (type.id() == LogicalTypeId::STRUCT && HasId(field_id)) {
 			schema_name = StringUtil::Format("r%d", field_id->GetFieldId());
 		}
 		auto result = CreateSchemaType(type, field_id, schema_name.c_str());
@@ -418,7 +422,7 @@ private:
 			auto &list_child = ListType::GetChildType(type);
 			auto element_field_id = GetChildFieldIdByName(field_id, "list");
 			AvroWriteSchema items;
-			if (list_child.id() == LogicalTypeId::STRUCT && element_field_id) {
+			if (list_child.id() == LogicalTypeId::STRUCT && HasId(element_field_id)) {
 				auto preset = StringUtil::Format("r%d", element_field_id->GetFieldId());
 				items = CreateSchemaType(list_child, element_field_id, preset.c_str());
 			} else {
@@ -473,7 +477,7 @@ private:
 		}
 		auto key = GetChildFieldIdByName(field_id, "key");
 		auto value = GetChildFieldIdByName(field_id, "value");
-		if (key && value) {
+		if (HasId(key) && HasId(value)) {
 			ids.key_id = key->GetFieldId();
 			ids.value_id = value->GetFieldId();
 			return true;
