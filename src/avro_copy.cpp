@@ -2,6 +2,7 @@
 
 #include "avro_binary.hpp"
 #include "field_ids.hpp"
+#include "read_avro.hpp"
 
 #include "duckdb/common/bswap.hpp"
 #include "duckdb/common/enums/file_compression_type.hpp"
@@ -1317,11 +1318,26 @@ idx_t WriteAvroFileSizeBytes(GlobalFunctionData &gstate) {
 	return gstate.Cast<WriteAvroGlobalState>().FileSize();
 }
 
+unique_ptr<FunctionData> ReadAvroCopyBind(ClientContext &context, CopyFromFunctionBindInput &input,
+                                          vector<Identifier> &expected_names, vector<LogicalType> &expected_types) {
+	auto info = input.info.Copy();
+	for (auto option : {"codec", "root_name", "field_ids", "sanitize_field_names", "metadata"}) {
+		info->options.erase(option);
+	}
+	CopyFromFunctionBindInput read_input(*info, input.tf);
+	return TableFunctionMultiFileWrapper::MultiFileBindCopyWith(context, read_input, expected_names, expected_types,
+	                                                            ReadAvro::GetSingleFileFunction(),
+	                                                            ReadAvro::GetMultiFileSettings());
+}
+
 } // namespace
 
 CopyFunction AvroCopyFunction::Create() {
 	CopyFunction function("avro");
 	function.extension = "avro";
+
+	function.copy_from_bind = ReadAvroCopyBind;
+	function.copy_from_function = *ReadAvro::GetFunctionSet().functions[0];
 
 	function.copy_to_bind = WriteAvroBind;
 	function.copy_to_initialize_local = WriteAvroInitializeLocal;
