@@ -22,3 +22,13 @@ statement error
 from avro_metadata('test/reader/binary_metadata.avro');
 ----
 Avro file "test/reader/binary_metadata.avro" has a metadata value for "user.binary" that is not valid UTF-8
+
+query I
+from read_avro('test/reader/binary_metadata_key.avro');
+----
+1
+
+statement error
+from avro_metadata('test/reader/binary_metadata_key.avro');
+----
+Avro file "test/reader/binary_metadata_key.avro" has a metadata key that is not valid UTF-8

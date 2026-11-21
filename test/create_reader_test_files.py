@@ -1890,10 +1890,24 @@ json_schema = """
 write("binary_metadata", json_schema, [{"n": 1}], metadata={"user.binary": b"\xff\xfe\x00\x01"})
 show("binary_metadata")
 
+write_bytes(
+    "binary_metadata_key",
+    b"Obj\x01"
+    + collection_bytes(
+        positive(
+            entry_bytes("avro.schema", bytes_bytes(json_schema.encode())),
+            bytes_bytes(b"user.\xff") + bytes_bytes(b"x"),
+        )
+    )
+    + SYNC
+    + block_bytes(long_bytes(1)),
+)
+
 
 for name, key, nullable_entry, records in (
     ("map_nullable_key", ["null", "int"], False, [{"m": [{"key": 1, "value": 10}, {"key": 2, "value": 20}]}]),
     ("map_null_key", ["null", "int"], False, [{"m": [{"key": 1, "value": 10}]}, {"m": [{"key": None, "value": 20}]}]),
+    ("map_null_later_key", ["null", "int"], False, [{"m": [{"key": 1, "value": 10}, {"key": None, "value": 20}]}]),
     ("map_null_entry", "int", True, [{"m": [{"key": 1, "value": 10}]}, {"m": [None]}]),
 ):
     entry = {
