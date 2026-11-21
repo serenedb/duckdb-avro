@@ -1,0 +1,21 @@
+# name: test/sql/reader/schema_option.test
+# description: read_avro maps a file onto the columns of the schema option by name, also under a Top-N, which then reads the rows instead of looking them up
+# group: [reader]
+
+require avro
+
+query II
+SELECT id, label FROM read_avro('test/reader/codec_null.avro', schema=map {
+	'id': {name: 'id', type: 'BIGINT', default_value: NULL},
+	'word': {name: 'label', type: 'VARCHAR', default_value: NULL}
+}) ORDER BY id DESC LIMIT 2
+----
+2999	row-02999xxxxxxxxx
+2998	row-02998xxxxxxxx
+
+query II
+SELECT count(*), sum(id) FROM read_avro('test/reader/codec_null.avro', schema=map {
+	'id': {name: 'id', type: 'BIGINT', default_value: NULL}
+})
+----
+3000	4498500

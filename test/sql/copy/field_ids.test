@@ -118,3 +118,18 @@ query II
 SELECT l, m FROM read_avro('{TEST_DIR}/field_ids_children_only_nested.avro');
 ----
 [{'a': 1}]	{k=2}
+
+# a map whose key has no id names its entry record like any other record, not after its key and value ids
+statement ok
+COPY (SELECT MAP {'k': 2} AS m) TO '{TEST_DIR}/field_ids_map_value_only.avro' (FIELD_IDS {'m': {'__duckdb_field_id': 1, 'value': 2}});
+
+query II
+SELECT regexp_extract_all(value, '"field-id":([0-9]+)', 1), regexp_extract(value, '"items":\{"type":"record","name":"([^"]+)"', 1)
+FROM avro_metadata('{TEST_DIR}/field_ids_map_value_only.avro') WHERE key = 'avro.schema';
+----
+[2, 1]	record0
+
+query I
+SELECT m FROM read_avro('{TEST_DIR}/field_ids_map_value_only.avro');
+----
+{k=2}

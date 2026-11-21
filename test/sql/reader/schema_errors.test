@@ -1,0 +1,232 @@
+# name: test/sql/reader/schema_errors.test
+# description: read_avro rejects a file whose schema is not JSON, misses a required attribute, names an unknown type or uses an unsupported logical type
+# group: [reader]
+
+require avro
+
+statement ok
+CREATE MACRO avro_long(n) AS from_hex(CASE
+	WHEN n < 64 THEN printf('%02x', 2 * n)
+	WHEN n < 8192 THEN printf('%02x%02x', 2 * n % 128 + 128, 2 * n // 128)
+	WHEN n < 1048576 THEN printf('%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384)
+	ELSE printf('%02x%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384 % 128 + 128, 2 * n // 2097152)
+END)
+
+statement ok
+CREATE MACRO avro_header(schema_text) AS 'Obj\x01\x02\x16avro.schema'::BLOB || avro_long(strlen(schema_text)) || encode(schema_text) || '\x00\x5D\x4E\x1A\xC0\xFF\xEE\x7A\x1B\x2C\x3D\x4E\x5F\x60\x71\x82\x93'::BLOB
+
+statement ok
+COPY (SELECT avro_header('{"type":')) TO '{TEST_DIR}/schema_not_json.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_not_json.avro')
+----
+Avro schema is not valid JSON
+
+statement ok
+COPY (SELECT avro_header('5')) TO '{TEST_DIR}/schema_number.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_number.avro')
+----
+Invalid Avro schema: a type must be a string, an object or an array
+
+statement ok
+COPY (SELECT avro_header('{"name":"r"}')) TO '{TEST_DIR}/schema_without_type.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_without_type.avro')
+----
+Invalid Avro schema: "type" field must be a string
+
+statement ok
+COPY (SELECT avro_header('{"type":5}')) TO '{TEST_DIR}/schema_number_type.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_number_type.avro')
+----
+Invalid Avro schema: "type" field must be a string
+
+statement ok
+COPY (SELECT avro_header('"record"')) TO '{TEST_DIR}/schema_record_string.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_record_string.avro')
+----
+Invalid Avro schema: a record type must be an object
+
+statement ok
+COPY (SELECT avro_header('"array"')) TO '{TEST_DIR}/schema_array_string.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_array_string.avro')
+----
+Invalid Avro schema: an array type must be an object
+
+statement ok
+COPY (SELECT avro_header('{"type":"record","fields":[]}')) TO '{TEST_DIR}/schema_record_without_name.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_record_without_name.avro')
+----
+Invalid Avro schema: record type must have a "name"
+
+statement ok
+COPY (SELECT avro_header('{"type":"record","name":1,"fields":[]}')) TO '{TEST_DIR}/schema_record_number_name.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_record_number_name.avro')
+----
+Invalid Avro schema: record type must have a "name"
+
+statement ok
+COPY (SELECT avro_header('{"type":"record","name":"r"}')) TO '{TEST_DIR}/schema_record_without_fields.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_record_without_fields.avro')
+----
+Invalid Avro schema: record type must have "fields"
+
+statement ok
+COPY (SELECT avro_header('{"type":"record","name":"r","fields":{}}')) TO '{TEST_DIR}/schema_record_object_fields.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_record_object_fields.avro')
+----
+Invalid Avro schema: record type must have "fields"
+
+statement ok
+COPY (SELECT avro_header('{"type":"record","name":"r","fields":[1]}')) TO '{TEST_DIR}/schema_number_field.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_number_field.avro')
+----
+Invalid Avro schema: field 0 of record r must be an object
+
+statement ok
+COPY (SELECT avro_header('{"type":"record","name":"r","fields":[{"type":"int"}]}')) TO '{TEST_DIR}/schema_field_without_name.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_field_without_name.avro')
+----
+Invalid Avro schema: field 0 of record r must have a "name"
+
+statement ok
+COPY (SELECT avro_header('{"type":"record","name":"r","fields":[{"name":"a","type":"int"},{"name":1,"type":"int"}]}')) TO '{TEST_DIR}/schema_field_number_name.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_field_number_name.avro')
+----
+Invalid Avro schema: field 1 of record r must have a "name"
+
+statement ok
+COPY (SELECT avro_header('{"type":"record","name":"r","fields":[{"name":"a"}]}')) TO '{TEST_DIR}/schema_field_without_type.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_field_without_type.avro')
+----
+Invalid Avro schema: field 0 of record r must have a "type"
+
+statement ok
+COPY (SELECT avro_header('{"type":"record","name":"r","fields":[{"name":"","type":"int"}]}')) TO '{TEST_DIR}/schema_field_empty_name.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_field_empty_name.avro')
+----
+Empty avro field name
+
+statement ok
+COPY (SELECT avro_header('{"type":"enum","name":"e"}')) TO '{TEST_DIR}/schema_enum_without_symbols.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_enum_without_symbols.avro')
+----
+Invalid Avro schema: enum type must have a non-empty "symbols" array
+
+statement ok
+COPY (SELECT avro_header('{"type":"enum","name":"e","symbols":"A"}')) TO '{TEST_DIR}/schema_enum_string_symbols.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_enum_string_symbols.avro')
+----
+Invalid Avro schema: enum type must have a non-empty "symbols" array
+
+statement ok
+COPY (SELECT avro_header('{"type":"enum","name":"e","symbols":[]}')) TO '{TEST_DIR}/schema_enum_no_symbols.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_enum_no_symbols.avro')
+----
+Invalid Avro schema: enum type must have a non-empty "symbols" array
+
+statement ok
+COPY (SELECT avro_header('{"type":"enum","name":"e","symbols":["A",1]}')) TO '{TEST_DIR}/schema_enum_number_symbol.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_enum_number_symbol.avro')
+----
+Invalid Avro schema: enum symbols must be strings
+
+statement ok
+COPY (SELECT avro_header('{"type":"fixed","name":"f"}')) TO '{TEST_DIR}/schema_fixed_without_size.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_fixed_without_size.avro')
+----
+Invalid Avro schema: fixed type must have a non-negative integer "size"
+
+statement ok
+COPY (SELECT avro_header('{"type":"fixed","name":"f","size":-1}')) TO '{TEST_DIR}/schema_fixed_negative_size.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_fixed_negative_size.avro')
+----
+Invalid Avro schema: fixed type must have a non-negative integer "size"
+
+statement ok
+COPY (SELECT avro_header('{"type":"array"}')) TO '{TEST_DIR}/schema_array_without_items.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_array_without_items.avro')
+----
+Invalid Avro schema: array type must have "items"
+
+statement ok
+COPY (SELECT avro_header('{"type":"map"}')) TO '{TEST_DIR}/schema_map_without_values.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_map_without_values.avro')
+----
+Invalid Avro schema: map type must have "values"
+
+statement ok
+COPY (SELECT avro_header('[]')) TO '{TEST_DIR}/schema_empty_union.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_empty_union.avro')
+----
+Invalid Avro schema: union type must have at least one branch
+
+statement ok
+COPY (SELECT avro_header('{"type":"record","name":"r","namespace":"ns","fields":[{"name":"a","type":"nope"}]}')) TO '{TEST_DIR}/schema_unknown_type.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_unknown_type.avro')
+----
+Invalid Avro schema: unknown type "nope"
+
+statement ok
+COPY (SELECT avro_header('{"type":"bytes","logicalType":"decimal","precision":39,"scale":2}')) TO '{TEST_DIR}/schema_wide_decimal.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_wide_decimal.avro')
+----
+Avro decimal precision 39 is larger than the supported maximum of 38
+
+statement ok
+COPY (SELECT avro_header('{"type":"long","logicalType":"timestamp-nanos","adjust-to-utc":true}')) TO '{TEST_DIR}/schema_utc_nanos.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/schema_utc_nanos.avro')
+----
+Avro timestamp-nanos with adjust_to_utc not supported

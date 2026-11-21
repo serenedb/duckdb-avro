@@ -1,5 +1,5 @@
 # name: test/sql/reader/empty_record.test
-# description: read_avro reads a record without fields as a "NULL" column, also inside an array, and decodes the fields after it
+# description: read_avro reads a record without fields as a "NULL" column, also inside an array or as a union branch, and decodes the fields after it; arrays of items that take no bytes, fixed of size 0 or records of nulls, keep their counts
 # group: [reader]
 
 require avro
@@ -17,3 +17,17 @@ SELECT * FROM read_avro('test/reader/empty_record.avro') ORDER BY id
 ----
 0	NULL	[]	a
 1	NULL	[NULL, NULL, NULL]	b
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/empty_items.avro'))
+----
+id	BIGINT
+blanks	BLOB[]
+units	STRUCT(n "NULL")[]
+maybe	BIGINT
+
+query IIIIII
+SELECT id, len(blanks), octet_length(blanks[1]), len(units), units[1], maybe FROM read_avro('test/reader/empty_items.avro') ORDER BY id
+----
+0	3	0	2	{'n': NULL}	NULL
+1	0	NULL	1	{'n': NULL}	42

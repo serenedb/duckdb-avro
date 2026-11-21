@@ -1,0 +1,123 @@
+# name: test/sql/reader/corrupt_blocks.test
+# description: read_avro rejects a block that does not decompress, is framed by a count, size or sync marker it cannot read, or holds more data than its records; it skips a block without records and cannot number more than 2^24 records of a block
+# group: [reader]
+
+require avro
+
+statement error
+FROM read_avro('test/reader/corrupt_deflate.avro')
+----
+Avro file "test/reader/corrupt_deflate.avro" is corrupt at the block at offset 240: Avro deflate block is corrupt: invalid block type
+
+statement error
+FROM read_avro('test/reader/corrupt_deflate_end.avro')
+----
+Avro file "test/reader/corrupt_deflate_end.avro" is corrupt at the block at offset 198: Avro deflate block is corrupt: the compressed data ends early
+
+statement error
+FROM read_avro('test/reader/corrupt_snappy_short.avro')
+----
+Avro file "test/reader/corrupt_snappy_short.avro" is corrupt at the block at offset 197: Avro snappy block is corrupt: the block is shorter than its checksum
+
+statement error
+FROM read_avro('test/reader/corrupt_snappy_length.avro')
+----
+Avro file "test/reader/corrupt_snappy_length.avro" is corrupt at the block at offset 197: Avro snappy block is corrupt: invalid uncompressed length
+
+statement error
+FROM read_avro('test/reader/corrupt_snappy_data.avro')
+----
+Avro file "test/reader/corrupt_snappy_data.avro" is corrupt at the block at offset 197: Avro snappy block is corrupt: invalid compressed data
+
+statement error
+FROM read_avro('test/reader/corrupt_snappy_checksum.avro')
+----
+Avro file "test/reader/corrupt_snappy_checksum.avro" is corrupt at the block at offset 197: Avro snappy block is corrupt: CRC32 checksum mismatch
+
+statement error
+FROM read_avro('test/reader/corrupt_zstandard.avro')
+----
+Avro file "test/reader/corrupt_zstandard.avro" is corrupt at the block at offset 200: Avro zstandard block is corrupt: Unknown frame descriptor
+
+statement error
+FROM read_avro('test/reader/corrupt_zstandard_end.avro')
+----
+Avro file "test/reader/corrupt_zstandard_end.avro" is corrupt at the block at offset 200: Avro zstandard block is corrupt: the compressed data ends early
+
+statement error
+FROM read_avro('test/reader/corrupt_zstandard_content_size.avro')
+----
+Avro file "test/reader/corrupt_zstandard_content_size.avro" is corrupt at the block at offset 144: Avro zstandard block is corrupt: Data corruption detected
+
+statement error
+FROM read_avro('test/reader/corrupt_snappy_declared_length.avro')
+----
+Avro file "test/reader/corrupt_snappy_declared_length.avro" is corrupt at the block at offset 197: Avro snappy block is corrupt: invalid uncompressed length
+
+query II
+SELECT id, length(word) FROM read_avro('test/reader/codec_snappy_runs.avro')
+----
+0	60000
+
+# a scan that decodes no column does not decompress its blocks
+query I
+SELECT count(*) FROM read_avro('test/reader/corrupt_deflate.avro')
+----
+10
+
+statement error
+FROM read_avro('test/reader/corrupt_block_count_malformed.avro')
+----
+<REGEX>:.*corrupt_block_count_malformed\.avro" is corrupt at the block at offset 237: a block is truncated or does not end with the file's sync marker.*
+
+statement error
+FROM read_avro('test/reader/corrupt_block_count_cut.avro')
+----
+<REGEX>:.*corrupt_block_count_cut\.avro" is corrupt at the block at offset 237: a block is truncated or does not end with the file's sync marker.*
+
+statement error
+FROM read_avro('test/reader/corrupt_block_size_malformed.avro')
+----
+<REGEX>:.*corrupt_block_size_malformed\.avro" is corrupt at the block at offset 237: a block is truncated or does not end with the file's sync marker.*
+
+statement error
+FROM read_avro('test/reader/corrupt_block_size_cut.avro')
+----
+<REGEX>:.*corrupt_block_size_cut\.avro" is corrupt at the block at offset 237: a block is truncated or does not end with the file's sync marker.*
+
+statement error
+FROM read_avro('test/reader/corrupt_block_count_negative.avro')
+----
+<REGEX>:.*corrupt_block_count_negative\.avro" is corrupt at the block at offset 237: a block is truncated or does not end with the file's sync marker.*
+
+statement error
+FROM read_avro('test/reader/corrupt_block_sync_cut.avro')
+----
+<REGEX>:.*corrupt_block_sync_cut\.avro" is corrupt at the block at offset 237: a block is truncated or does not end with the file's sync marker.*
+
+query II
+SELECT id, word FROM read_avro('test/reader/empty_block.avro')
+----
+0	a
+1	b
+2	c
+
+query I
+SELECT count(*) FROM read_avro('test/reader/block_trailing_bytes.avro')
+----
+2
+
+statement error
+SELECT id FROM read_avro('test/reader/block_trailing_bytes.avro')
+----
+Avro file "test/reader/block_trailing_bytes.avro" is corrupt at the block at offset 195: the records of a block do not fill its data
+
+query I
+SELECT count(*) FROM read_avro('test/reader/block_many_records.avro')
+----
+16777217
+
+statement error
+SELECT max(file_row_number) FROM read_avro('test/reader/block_many_records.avro')
+----
+Avro file "test/reader/block_many_records.avro" has a block at offset 142 that file_row_number cannot address: blocks must start below 549755813888 and hold at most 16777216 records

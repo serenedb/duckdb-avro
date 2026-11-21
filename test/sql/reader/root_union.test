@@ -1,0 +1,39 @@
+# name: test/sql/reader/root_union.test
+# description: read_avro reads a file whose root schema is a union of null and a record as the record's columns, with every column NULL for a null record, also when a filter decodes some columns first
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/root_union.avro'))
+----
+a	BIGINT
+b	VARCHAR
+c	DOUBLE
+
+query III
+SELECT * FROM read_avro('test/reader/root_union.avro')
+----
+NULL	NULL	NULL
+1	x	1.5
+NULL	y	2.5
+NULL	NULL	NULL
+3	z	3.5
+
+query II
+SELECT a, b FROM read_avro('test/reader/root_union.avro') WHERE a IS NULL
+----
+NULL	NULL
+NULL	y
+NULL	NULL
+
+query II
+SELECT b, c FROM read_avro('test/reader/root_union.avro') WHERE c > 2
+----
+y	2.5
+z	3.5
+
+query I
+SELECT count(*) FROM read_avro('test/reader/root_union.avro')
+----
+5

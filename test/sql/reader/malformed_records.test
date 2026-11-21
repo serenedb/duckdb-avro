@@ -1,0 +1,95 @@
+# name: test/sql/reader/malformed_records.test
+# description: read_avro rejects a record holding a number, length, value or array count it cannot read, whether it decodes or skips the field, and a value its type cannot hold once it decodes it, also only for the rows a filter keeps
+# group: [reader]
+
+require avro
+
+statement error
+SELECT n FROM read_avro('test/reader/malformed_long.avro')
+----
+Avro file "test/reader/malformed_long.avro" is corrupt at the block at offset 171: a number is malformed or runs past the end of its block
+
+statement error
+SELECT id FROM read_avro('test/reader/malformed_long.avro')
+----
+<REGEX>:.*malformed_long\.avro" is corrupt at the block at offset 171: a number is malformed\n
+
+statement error
+SELECT n FROM read_avro('test/reader/long_past_end.avro')
+----
+Avro file "test/reader/long_past_end.avro" is corrupt at the block at offset 170: a number is malformed or runs past the end of its block
+
+statement error
+SELECT id FROM read_avro('test/reader/long_past_end.avro')
+----
+Avro file "test/reader/long_past_end.avro" is corrupt at the block at offset 170: a number runs past the end of its block
+
+statement error
+SELECT s FROM read_avro('test/reader/negative_length.avro')
+----
+Avro file "test/reader/negative_length.avro" is corrupt at the block at offset 174: a length is negative or runs past the end of its block
+
+statement error
+SELECT s FROM read_avro('test/reader/length_past_end.avro')
+----
+Avro file "test/reader/length_past_end.avro" is corrupt at the block at offset 174: a length is negative or runs past the end of its block
+
+statement error
+SELECT flag FROM read_avro('test/reader/boolean_past_end.avro')
+----
+Avro file "test/reader/boolean_past_end.avro" is corrupt at the block at offset 179: a value runs past the end of its block
+
+statement error
+SELECT a FROM read_avro('test/reader/array_count_min.avro')
+----
+Avro file "test/reader/array_count_min.avro" is corrupt at the block at offset 200: an array or map block count is out of range
+
+statement error
+SELECT a FROM read_avro('test/reader/array_count_past_end.avro')
+----
+Avro file "test/reader/array_count_past_end.avro" is corrupt at the block at offset 205: an array or map block count exceeds its data
+
+statement error
+SELECT a FROM read_avro('test/reader/array_count_empty_items.avro')
+----
+Avro file "test/reader/array_count_empty_items.avro" is corrupt at the block at offset 208: an array or map block count exceeds its data
+
+query IIIIII
+SELECT id, i, u, dur, nested.t, nested.ts FROM read_avro('test/reader/invalid_values.avro') WHERE id = 0
+----
+0	7	123e4567-e89b-12d3-a456-426614174000	1 mon 2 days 00:00:00.003	00:00:01	1970-01-01 00:00:01
+
+statement error
+SELECT * FROM read_avro('test/reader/invalid_values.avro')
+----
+Avro file "test/reader/invalid_values.avro" is corrupt at the block at offset 1274: an int is out of range
+
+statement error
+SELECT i FROM read_avro('test/reader/invalid_values.avro') WHERE id = 1
+----
+Avro file "test/reader/invalid_values.avro" is corrupt at the block at offset 1274: an int is out of range
+
+statement error
+SELECT i FROM read_avro('test/reader/invalid_values.avro') WHERE id = 2
+----
+Avro file "test/reader/invalid_values.avro" is corrupt at the block at offset 1274: an int is out of range
+
+statement error
+SELECT u FROM read_avro('test/reader/invalid_values.avro') WHERE id = 3
+----
+Avro file "test/reader/invalid_values.avro" is corrupt at the block at offset 1274: a uuid string is not a valid UUID
+
+statement error
+SELECT dur FROM read_avro('test/reader/invalid_values.avro') WHERE id = 4
+----
+Avro file "test/reader/invalid_values.avro" is corrupt at the block at offset 1274: a duration is out of range
+
+statement error
+SELECT nested FROM read_avro('test/reader/invalid_values.avro') WHERE id = 5
+----
+Avro file "test/reader/invalid_values.avro" is corrupt at the block at offset 1274: a timestamp-millis value is out of range
+
+query II
+SELECT count(*), sum(id) FROM read_avro('test/reader/invalid_values.avro') WHERE id > 0
+----
+5	15

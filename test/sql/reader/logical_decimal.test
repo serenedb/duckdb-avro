@@ -1,5 +1,5 @@
 # name: test/sql/reader/logical_decimal.test
-# description: read_avro reads decimals on bytes and on fixed, minimal and wider than needed, with precision 4, 9, 18 and 38
+# description: read_avro reads decimals on bytes and on fixed, minimal and wider than needed, with precision 4, 9, 18 and 38, also empty or in more bytes than their precision needs, and rejects a value that does not fit its precision
 # group: [reader]
 
 require avro
@@ -68,3 +68,49 @@ SELECT * FROM read_avro('test/reader/logical_decimal_fixed.avro') ORDER BY id
 11	NULL	NULL	NULL	NULL	NULL	NULL	99999999999999999999999999999999999999	0.99999999999999999999999999999999999999	NULL	9999999999999999999999999999.9999999999
 12	NULL	NULL	NULL	NULL	NULL	NULL	-99999999999999999999999999999999999999	-0.99999999999999999999999999999999999999	NULL	-9999999999999999999999999999.9999999999
 13	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/decimal_width.avro'))
+----
+id	BIGINT
+b4	DECIMAL(4,0)
+b18	DECIMAL(18,0)
+b38	DECIMAL(38,0)
+f4	DECIMAL(4,0)
+f9	DECIMAL(9,0)
+f18	DECIMAL(18,0)
+
+query IIIIIII
+SELECT * FROM read_avro('test/reader/decimal_width.avro') WHERE id = 0
+----
+0	0	-123456789012	10000000000000000000000000000000000000	-1234	123456789	-123456789012345678
+
+statement error
+SELECT b4 FROM read_avro('test/reader/decimal_width.avro') WHERE id = 1
+----
+Avro file "test/reader/decimal_width.avro" is corrupt at the block at offset 1281: a decimal value does not fit its precision
+
+statement error
+SELECT b4 FROM read_avro('test/reader/decimal_width.avro') WHERE id = 2
+----
+Avro file "test/reader/decimal_width.avro" is corrupt at the block at offset 1281: a decimal value does not fit its precision
+
+statement error
+SELECT b38 FROM read_avro('test/reader/decimal_width.avro') WHERE id = 3
+----
+Avro file "test/reader/decimal_width.avro" is corrupt at the block at offset 1281: a decimal value does not fit its precision
+
+statement error
+SELECT b38 FROM read_avro('test/reader/decimal_width.avro') WHERE id = 4
+----
+Avro file "test/reader/decimal_width.avro" is corrupt at the block at offset 1281: a decimal value does not fit its precision
+
+statement error
+SELECT f18 FROM read_avro('test/reader/decimal_width.avro') WHERE id = 5
+----
+Avro file "test/reader/decimal_width.avro" is corrupt at the block at offset 1281: a decimal value does not fit its precision
+
+statement error
+SELECT f4 FROM read_avro('test/reader/decimal_width.avro') WHERE id = 6
+----
+Avro file "test/reader/decimal_width.avro" is corrupt at the block at offset 1281: a decimal value does not fit its precision

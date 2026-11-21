@@ -1,0 +1,99 @@
+# name: test/sql/reader/schema_fallbacks.test
+# description: read_avro reads logical types with unusable parameters as their underlying type, ignores unusable field ids and namespaces, maps only two-field records of arrays with logicalType map, and names a column after the root schema
+# group: [reader]
+
+require avro
+
+statement ok
+CREATE MACRO avro_long(n) AS from_hex(CASE
+	WHEN n < 64 THEN printf('%02x', 2 * n)
+	WHEN n < 8192 THEN printf('%02x%02x', 2 * n % 128 + 128, 2 * n // 128)
+	WHEN n < 1048576 THEN printf('%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384)
+	ELSE printf('%02x%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384 % 128 + 128, 2 * n // 2097152)
+END)
+
+statement ok
+CREATE MACRO avro_header(schema_text) AS 'Obj\x01\x02\x16avro.schema'::BLOB || avro_long(strlen(schema_text)) || encode(schema_text) || '\x00\x5D\x4E\x1A\xC0\xFF\xEE\x7A\x1B\x2C\x3D\x4E\x5F\x60\x71\x82\x93'::BLOB
+
+statement ok
+COPY (SELECT avro_header('{
+	"type": "record", "name": "fallbacks", "namespace": "ns",
+	"fields": [
+		{"name": "logical_number", "type": {"type": "int", "logicalType": 5}},
+		{"name": "decimal_without_precision", "type": {"type": "bytes", "logicalType": "decimal", "scale": 2}},
+		{"name": "decimal_text_precision", "type": {"type": "bytes", "logicalType": "decimal", "precision": "4"}},
+		{"name": "decimal_huge_precision", "type": {"type": "bytes", "logicalType": "decimal", "precision": 18446744073709551615}},
+		{"name": "decimal_negative_precision", "type": {"type": "bytes", "logicalType": "decimal", "precision": -4}},
+		{"name": "decimal_without_scale", "type": {"type": "bytes", "logicalType": "decimal", "precision": 5}},
+		{"name": "decimal_text_scale", "type": {"type": "bytes", "logicalType": "decimal", "precision": 5, "scale": "1"}},
+		{"name": "decimal_negative_scale", "type": {"type": "bytes", "logicalType": "decimal", "precision": 5, "scale": -1}},
+		{"name": "utc_text", "type": {"type": "long", "logicalType": "timestamp-micros", "adjust-to-utc": "true"}},
+		{"name": "utc_false", "type": {"type": "long", "logicalType": "timestamp-micros", "adjust-to-utc": false}},
+		{"name": "id_text", "type": "int", "field-id": "1"},
+		{"name": "id_below_int", "type": "int", "field-id": -3000000000},
+		{"name": "id_int_max", "type": "int", "field-id": 2147483647},
+		{"name": "namespace_number", "type": {"type": "fixed", "name": "f4", "namespace": 5, "size": 4}},
+		{"name": "plain", "type": {"type": "fixed", "name": "plain4", "namespace": "", "size": 4}},
+		{"name": "plain_reference", "type": "plain4"},
+		{"name": "map_of_nullable_entries", "type": {"type": "array", "logicalType": "map", "items": ["null", {"type": "record", "name": "entry", "fields": [{"name": "key", "type": "string"}, {"name": "value", "type": "int"}]}]}},
+		{"name": "map_of_union", "type": {"type": "array", "logicalType": "map", "items": ["int", "long"]}},
+		{"name": "map_of_int", "type": {"type": "array", "logicalType": "map", "items": "int"}},
+		{"name": "map_of_triples", "type": {"type": "array", "logicalType": "map", "items": {"type": "record", "name": "triple", "fields": [{"name": "k", "type": "int"}, {"name": "v", "type": "int"}, {"name": "x", "type": "int"}]}}}
+	]
+}')) TO '{TEST_DIR}/schema_fallbacks.avro' (FORMAT BLOB)
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('{TEST_DIR}/schema_fallbacks.avro'))
+----
+logical_number	INTEGER
+decimal_without_precision	BLOB
+decimal_text_precision	BLOB
+decimal_huge_precision	BLOB
+decimal_negative_precision	BLOB
+decimal_without_scale	DECIMAL(5,0)
+decimal_text_scale	BLOB
+decimal_negative_scale	BLOB
+utc_text	TIMESTAMP
+utc_false	TIMESTAMP
+id_text	INTEGER
+id_below_int	INTEGER
+id_int_max	INTEGER
+namespace_number	BLOB
+plain	BLOB
+plain_reference	BLOB
+map_of_nullable_entries	MAP(VARCHAR, INTEGER)
+map_of_union	UNION(u0 INTEGER, u1 BIGINT)[]
+map_of_int	INTEGER[]
+map_of_triples	STRUCT(k INTEGER, v INTEGER, x INTEGER)[]
+
+statement ok
+COPY (SELECT avro_header('{"type":"enum","name":"suit","symbols":["SPADES","HEARTS"]}')) TO '{TEST_DIR}/schema_root_enum.avro' (FORMAT BLOB)
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('{TEST_DIR}/schema_root_enum.avro'))
+----
+suit	ENUM('SPADES', 'HEARTS')
+
+statement ok
+COPY (SELECT avro_header('{"type":"fixed","name":"x.y.hash","size":4}')) TO '{TEST_DIR}/schema_root_fixed.avro' (FORMAT BLOB)
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('{TEST_DIR}/schema_root_fixed.avro'))
+----
+hash	BLOB
+
+statement ok
+COPY (SELECT avro_header('{"type":"long","logicalType":"timestamp-millis"}')) TO '{TEST_DIR}/schema_root_long.avro' (FORMAT BLOB)
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('{TEST_DIR}/schema_root_long.avro'))
+----
+avro_schema	TIMESTAMP
+
+statement ok
+COPY (SELECT avro_header('{"type":"record","name":"","fields":[{"name":"a","type":"int"}]}')) TO '{TEST_DIR}/schema_root_unnamed.avro' (FORMAT BLOB)
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('{TEST_DIR}/schema_root_unnamed.avro'))
+----
+a	INTEGER

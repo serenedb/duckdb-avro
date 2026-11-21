@@ -1,5 +1,5 @@
 # name: test/sql/reader/codecs.test
-# description: read_avro decodes the same rows from files Apache avro wrote with every codec, each in 260 blocks
+# description: read_avro decodes the same rows from files Apache avro wrote with every codec, each in 260 blocks, and zstandard blocks of several frames or larger than their first output buffer
 # group: [reader]
 
 require avro
@@ -103,3 +103,13 @@ statement error
 SELECT * FROM read_avro('test/reader/codec_bzip2.avro')
 ----
 Unknown codec bzip2
+
+query III
+SELECT count(*), sum(id), list(word ORDER BY id) FROM read_avro('test/reader/codec_zstandard_frames.avro')
+----
+5	10	[word 0, word 1, word 2, word 3, word 4]
+
+query II
+SELECT count(*), sum(n) FROM read_avro('test/reader/codec_zstandard_large.avro')
+----
+100000	100000

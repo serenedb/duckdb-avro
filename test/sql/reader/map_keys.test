@@ -1,0 +1,25 @@
+# name: test/sql/reader/map_keys.test
+# description: an array with logicalType map is a MAP even when its schema lets a key or an entry be NULL, and a NULL key or entry in the data is an error
+# group: [reader]
+
+require avro
+
+query II
+SELECT typeof(m), m FROM read_avro('test/reader/map_nullable_key.avro')
+----
+MAP(INTEGER, BIGINT)	{1=10, 2=20}
+
+statement error
+FROM read_avro('test/reader/map_null_key.avro')
+----
+<REGEX>:.*map_null_key\.avro" is corrupt at the block at offset \d+: a map key is NULL.*
+
+statement error
+FROM read_avro('test/reader/map_null_entry.avro')
+----
+<REGEX>:.*map_null_entry\.avro" is corrupt at the block at offset \d+: a map key is NULL.*
+
+query I
+SELECT count(*) FROM read_avro('test/reader/map_null_key.avro')
+----
+2

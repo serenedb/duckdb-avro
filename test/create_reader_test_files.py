@@ -5,11 +5,13 @@ import os
 import struct
 import uuid
 import warnings
+import zlib
 
 import avro.codecs
 import avro.errors
 import avro.io
 import avro.schema
+import snappy
 import zstandard
 from avro.datafile import DataFileReader, DataFileWriter
 from avro.io import DatumReader, DatumWriter
@@ -73,7 +75,7 @@ def show_failure(name):
     try:
         records = read(name)
     except Exception as error:
-        print(f"{path(name)}: avro fails with {type(error).__name__}: {str(error).splitlines()[0]}")
+        print(f"{path(name)}: avro fails with {type(error).__name__}: {(str(error).splitlines() or [''])[0]}")
         return
     raise AssertionError(f"{path(name)} reads back {len(records)} records")
 
@@ -199,22 +201,25 @@ def collection_bytes(*blocks):
     return out + long_bytes(0)
 
 
-def header_bytes(json_schema):
+def header_bytes(json_schema, codec="null"):
     return (
         b"Obj\x01"
         + collection_bytes(
             positive(
                 entry_bytes("avro.schema", bytes_bytes(json_schema.encode())),
-                entry_bytes("avro.codec", bytes_bytes(b"null")),
+                entry_bytes("avro.codec", bytes_bytes(codec.encode())),
             )
         )
         + SYNC
     )
 
 
+def raw_block_bytes(count, data):
+    return long_bytes(count) + long_bytes(len(data)) + data + SYNC
+
+
 def block_bytes(*records):
-    data = b"".join(records)
-    return long_bytes(len(records)) + long_bytes(len(data)) + data + SYNC
+    return raw_block_bytes(len(records), b"".join(records))
 
 
 def write_bytes(name, content):
@@ -1505,3 +1510,407 @@ write_bytes(
 )
 records = read("false_sync")
 print(f"{path('false_sync')}: {len(records)} records, sum(len(payload)) = {sum(len(r['payload']) for r in records)}")
+
+
+json_schema = """
+{
+  "type": "record",
+  "name": "codec_block",
+  "fields": [
+    {"name": "id", "type": "long"},
+    {"name": "word", "type": "string"}
+  ]
+}
+"""
+
+codec_data = b"".join(L(i) + S(f"word {i}") for i in range(5))
+
+
+def raw_deflate(data, flush=zlib.Z_FINISH):
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+    return compressor.compress(data) + compressor.flush(flush)
+
+
+def write_codec_blocks(name, codec, *blocks):
+    header = header_bytes(json_schema, codec)
+    write_bytes(name, header + b"".join(blocks))
+    print(f"{path(name)}: last block at offset {len(header) + sum(len(block) for block in blocks[:-1])}")
+
+
+write_codec_blocks(
+    "corrupt_deflate", "deflate", raw_block_bytes(5, raw_deflate(codec_data)), raw_block_bytes(5, b"\xff" * 8)
+)
+show_failure("corrupt_deflate")
+
+ends_early_data = L(0) + S("x" * 65532)
+ends_early = raw_deflate(ends_early_data, zlib.Z_SYNC_FLUSH)
+assert len(ends_early_data) == 65536 and ends_early.endswith(b"\x00\x00\xff\xff") and len(ends_early) * 4 < 65536
+ends_early = ends_early[:-4]
+inflater = zlib.decompressobj(-15)
+assert inflater.decompress(ends_early, 65536) == ends_early_data
+assert not inflater.unconsumed_tail and not inflater.eof and inflater.decompress(b"", 65536) == b""
+write_codec_blocks("corrupt_deflate_end", "deflate", raw_block_bytes(1, ends_early))
+show_failure("corrupt_deflate_end")
+
+for name, data in (
+    ("corrupt_snappy_short", b"\x00\x00\x00"),
+    ("corrupt_snappy_length", b"\xff" * 6 + bytes(4)),
+    ("corrupt_snappy_data", b"\x0a\x24abc" + bytes(4)),
+    ("corrupt_snappy_checksum", snappy.compress(codec_data) + (zlib.crc32(codec_data) ^ 1).to_bytes(4, "big")),
+    ("corrupt_snappy_declared_length", b"\x80\x80\x80\x80\x08" + b"\x00a" + bytes(4)),
+):
+    write_codec_blocks(name, "snappy", raw_block_bytes(5, data))
+    show_failure(name)
+
+runs_data = L(0) + S("a" * 60000)
+runs = snappy.compress(runs_data)
+assert len(runs_data) > 20 * len(runs)
+write_codec_blocks("codec_snappy_runs", "snappy", raw_block_bytes(1, runs + zlib.crc32(runs_data).to_bytes(4, "big")))
+assert read("codec_snappy_runs") == [{"id": 0, "word": "a" * 60000}]
+print(f"{path('codec_snappy_runs')}: {len(runs_data)} bytes from {len(runs)} snappy bytes")
+
+write_codec_blocks("corrupt_zstandard", "zstandard", raw_block_bytes(5, bytes(8)))
+show_failure("corrupt_zstandard")
+write_codec_blocks(
+    "corrupt_zstandard_end", "zstandard", raw_block_bytes(5, zstandard.ZstdCompressor().compress(codec_data)[:-3])
+)
+show_failure("corrupt_zstandard_end")
+
+frames = [zstandard.ZstdCompressor().compress(part) for part in (codec_data[:20], codec_data[20:])]
+assert b"".join(zstandard.ZstdDecompressor().decompress(frame) for frame in frames) == codec_data
+write_codec_blocks("codec_zstandard_frames", "zstandard", raw_block_bytes(5, b"".join(frames)))
+
+json_schema = """
+{
+  "type": "record",
+  "name": "ones",
+  "fields": [{"name": "n", "type": "long"}]
+}
+"""
+
+frame = zstandard.ZstdCompressor(write_content_size=False).compress(L(1) * 100000)
+assert zstandard.get_frame_parameters(frame).content_size == zstandard.CONTENTSIZE_UNKNOWN
+assert len(frame) * 4 < 65536
+write_bytes("codec_zstandard_large", header_bytes(json_schema, "zstandard") + raw_block_bytes(100000, frame))
+records = read("codec_zstandard_large")
+assert records == [{"n": 1}] * 100000
+print(f"{path('codec_zstandard_large')}: {len(records)} records in a block of {len(frame)} bytes")
+
+frame = (
+    b"\x28\xb5\x2f\xfd\xc0\x38"
+    + (2**64 - 3).to_bytes(8, "little")
+    + ((100000 << 3) | (1 << 1) | 1).to_bytes(3, "little")
+    + L(1)
+)
+assert zstandard.get_frame_parameters(frame).content_size == 2**64 - 3
+write_bytes("corrupt_zstandard_content_size", header_bytes(json_schema, "zstandard") + raw_block_bytes(100000, frame))
+show_failure("corrupt_zstandard_content_size")
+
+
+json_schema = """
+{
+  "type": "record",
+  "name": "block_frame",
+  "fields": [
+    {"name": "id", "type": "long"},
+    {"name": "word", "type": "string"}
+  ]
+}
+"""
+
+frame_header = header_bytes(json_schema)
+frame_first = block_bytes(*[L(i) + S(f"word {i}") for i in range(3)])
+frame_last = L(3) + S("word 3")
+for name, tail in (
+    ("corrupt_block_count_malformed", b"\x80" * 10 + bytes(32)),
+    ("corrupt_block_count_cut", b"\x80"),
+    ("corrupt_block_size_malformed", L(1) + b"\x80" * 10 + bytes(32)),
+    ("corrupt_block_size_cut", L(1) + b"\x80"),
+    ("corrupt_block_count_negative", L(-1) + L(len(frame_last)) + frame_last + SYNC),
+    ("corrupt_block_sync_cut", L(1) + L(len(frame_last)) + frame_last + SYNC[:10]),
+):
+    write_bytes(name, frame_header + frame_first + tail)
+    print(f"{path(name)}: second block at offset {len(frame_header) + len(frame_first)}")
+
+write_bytes(
+    "empty_block",
+    frame_header + block_bytes(L(0) + S("a"), L(1) + S("b")) + raw_block_bytes(0, b"") + block_bytes(L(2) + S("c")),
+)
+show("empty_block")
+
+write_bytes("block_trailing_bytes", frame_header + raw_block_bytes(2, L(0) + S("a") + L(1) + S("b") + bytes(3)))
+print(f"{path('block_trailing_bytes')}: block at offset {len(frame_header)}")
+
+json_schema = """
+{
+  "type": "record",
+  "name": "nothing",
+  "fields": [{"name": "n", "type": "null"}]
+}
+"""
+
+many_records_header = header_bytes(json_schema)
+write_bytes("block_many_records", many_records_header + raw_block_bytes(2**24 + 1, b""))
+print(f"{path('block_many_records')}: {2**24 + 1} records in a block at offset {len(many_records_header)}")
+
+
+def record_schema(name, *fields):
+    return json.dumps(
+        {"type": "record", "name": name, "fields": [{"name": n, "type": t} for n, t in (("id", "long"),) + fields]}
+    )
+
+
+for name, json_schema, records in (
+    ("malformed_long", record_schema("malformed_long", ("n", "long")), [L(0) + L(5), L(1) + b"\x80" * 10]),
+    ("long_past_end", record_schema("long_past_end", ("n", "long")), [L(0) + L(5), L(1) + b"\x80"]),
+    ("negative_length", record_schema("negative_length", ("s", "string")), [L(0) + S("a"), L(1) + L(-1)]),
+    ("length_past_end", record_schema("length_past_end", ("s", "string")), [L(0) + S("a"), L(1) + L(100) + b"ab"]),
+    ("boolean_past_end", record_schema("boolean_past_end", ("flag", "boolean")), [L(0) + b"\x01", L(1)]),
+    (
+        "array_count_min",
+        record_schema("array_count_min", ("a", {"type": "array", "items": "long"})),
+        [L(0) + collection_bytes(positive(L(7))), L(1) + L(-(2**63))],
+    ),
+    (
+        "array_count_past_end",
+        record_schema("array_count_past_end", ("a", {"type": "array", "items": "long"})),
+        [L(0) + collection_bytes(positive(L(7))), L(1) + L(100) + L(7)],
+    ),
+    (
+        "array_count_empty_items",
+        record_schema("array_count_empty_items", ("a", {"type": "array", "items": "null"})),
+        [L(0) + collection_bytes(positive(b"", b"")), L(1) + L(2**32 + 1) + L(0)],
+    ),
+):
+    header = header_bytes(json_schema)
+    write_bytes(name, header + block_bytes(*records))
+    print(f"{path(name)}: block at offset {len(header)}")
+
+
+json_schema = json.dumps(
+    {
+        "type": "record",
+        "name": "invalid_values",
+        "fields": [
+            {"name": "id", "type": "long"},
+            {"name": "i", "type": "int"},
+            {"name": "u", "type": {"type": "string", "logicalType": "uuid"}},
+            {"name": "dur", "type": {"type": "fixed", "name": "dur12", "size": 12, "logicalType": "duration"}},
+            {
+                "name": "nested",
+                "type": {
+                    "type": "record",
+                    "name": "nested_times",
+                    "fields": [
+                        {"name": "t", "type": {"type": "int", "logicalType": "time-millis"}},
+                        {"name": "ts", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+                    ],
+                },
+            },
+            {
+                "name": "floats",
+                "type": {
+                    "type": "record",
+                    "name": "float_pair",
+                    "fields": [{"name": "f", "type": "float"}, {"name": "d", "type": "double"}],
+                },
+            },
+        ],
+    },
+    indent=2,
+)
+
+
+def invalid_values_row(i, int_value=7, uuid_text="123e4567-e89b-12d3-a456-426614174000", days=2, ts=1000):
+    return (
+        L(i)
+        + L(int_value)
+        + S(uuid_text)
+        + struct.pack("<III", 1, days, 3)
+        + L(1000)
+        + L(ts)
+        + struct.pack("<fd", 1.5, 2.5)
+    )
+
+
+invalid_values_header = header_bytes(json_schema)
+write_bytes(
+    "invalid_values",
+    invalid_values_header
+    + block_bytes(
+        invalid_values_row(0),
+        invalid_values_row(1, int_value=2**31),
+        invalid_values_row(2, int_value=-(2**31) - 1),
+        invalid_values_row(3, uuid_text="not-a-uuid"),
+        invalid_values_row(4, days=2**31),
+        invalid_values_row(5, ts=2**62),
+    ),
+)
+print(f"{path('invalid_values')}: block at offset {len(invalid_values_header)}")
+
+
+json_schema = json.dumps(
+    {
+        "type": "record",
+        "name": "decimal_width",
+        "fields": [{"name": "id", "type": "long"}]
+        + [
+            {"name": f"b{p}", "type": {"type": "bytes", "logicalType": "decimal", "precision": p, "scale": 0}}
+            for p in (4, 18, 38)
+        ]
+        + [
+            {
+                "name": f"f{p}",
+                "type": {
+                    "type": "fixed",
+                    "name": f"fixed{p}_12",
+                    "size": 12,
+                    "logicalType": "decimal",
+                    "precision": p,
+                    "scale": 0,
+                },
+            }
+            for p in (4, 9, 18)
+        ],
+    },
+    indent=2,
+)
+
+
+def twos(value, size):
+    return value.to_bytes(size, "big", signed=True)
+
+
+def decimal_width_row(
+    i,
+    b4=b"",
+    b18=twos(-123456789012, 12),
+    b38=twos(10**37, 17),
+    f4=-1234,
+    f9=123456789,
+    f18=-123456789012345678,
+):
+    return L(i) + bytes_bytes(b4) + bytes_bytes(b18) + bytes_bytes(b38) + twos(f4, 12) + twos(f9, 12) + twos(f18, 12)
+
+
+decimal_width_header = header_bytes(json_schema)
+write_bytes(
+    "decimal_width",
+    decimal_width_header
+    + block_bytes(
+        decimal_width_row(0),
+        decimal_width_row(1, b4=twos(40000, 3)),
+        decimal_width_row(2, b4=twos(-40000, 3)),
+        decimal_width_row(3, b38=b"\x01" + bytes(16)),
+        decimal_width_row(4, b38=b"\x00\x80" + bytes(15)),
+        decimal_width_row(5, f18=2**70),
+        decimal_width_row(6, f4=40000),
+    ),
+)
+print(f"{path('decimal_width')}: block at offset {len(decimal_width_header)}")
+
+
+json_schema = json.dumps(
+    {
+        "type": "record",
+        "name": "empty_items",
+        "fields": [
+            {"name": "id", "type": "long"},
+            {"name": "blanks", "type": {"type": "array", "items": {"type": "fixed", "name": "fixed0", "size": 0}}},
+            {
+                "name": "units",
+                "type": {
+                    "type": "array",
+                    "items": {"type": "record", "name": "unit", "fields": [{"name": "n", "type": "null"}]},
+                },
+            },
+            {"name": "maybe", "type": [{"type": "record", "name": "nothing", "fields": []}, "long"]},
+        ],
+    },
+    indent=2,
+)
+
+write_bytes(
+    "empty_items",
+    header_bytes(json_schema)
+    + block_bytes(
+        L(0) + collection_bytes(positive(b"", b"", b"")) + collection_bytes(positive(b"", b"")) + L(0),
+        L(1) + collection_bytes() + collection_bytes(positive(b"")) + L(1) + L(42),
+    ),
+)
+show("empty_items")
+
+
+json_schema = json.dumps(
+    [
+        "null",
+        {
+            "type": "record",
+            "name": "row",
+            "fields": [
+                {"name": "a", "type": ["null", "long"]},
+                {"name": "b", "type": "string"},
+                {"name": "c", "type": "double"},
+            ],
+        },
+    ],
+    indent=2,
+)
+
+write(
+    "root_union",
+    json_schema,
+    [None, {"a": 1, "b": "x", "c": 1.5}, {"a": None, "b": "y", "c": 2.5}, None, {"a": 3, "b": "z", "c": 3.5}],
+)
+show("root_union")
+
+
+json_schema = """
+{
+  "type": "record",
+  "name": "tail",
+  "fields": [{"name": "id", "type": "long"}]
+}
+"""
+
+tail_block = block_bytes(L(5))
+assert len(tail_block) == 19
+write_bytes("lookup_tail", header_bytes(json_schema) + block_bytes(*[L(i) for i in range(5)]) + tail_block)
+show("lookup_tail")
+
+
+json_schema = """
+{
+  "type": "record",
+  "name": "binary_metadata",
+  "fields": [{"name": "n", "type": "long"}]
+}
+"""
+
+write("binary_metadata", json_schema, [{"n": 1}], metadata={"user.binary": b"\xff\xfe\x00\x01"})
+show("binary_metadata")
+
+
+for name, key, nullable_entry, records in (
+    ("map_nullable_key", ["null", "int"], False, [{"m": [{"key": 1, "value": 10}, {"key": 2, "value": 20}]}]),
+    ("map_null_key", ["null", "int"], False, [{"m": [{"key": 1, "value": 10}]}, {"m": [{"key": None, "value": 20}]}]),
+    ("map_null_entry", "int", True, [{"m": [{"key": 1, "value": 10}]}, {"m": [None]}]),
+):
+    entry = {
+        "type": "record",
+        "name": f"{name}_entry",
+        "fields": [{"name": "key", "type": key}, {"name": "value", "type": "long"}],
+    }
+    items = ["null", entry] if nullable_entry else entry
+    write(
+        name,
+        json.dumps(
+            {
+                "type": "record",
+                "name": name,
+                "fields": [{"name": "m", "type": {"type": "array", "logicalType": "map", "items": items}}],
+            }
+        ),
+        records,
+    )
+    show(name)

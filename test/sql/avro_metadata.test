@@ -12,3 +12,13 @@ query II
 from avro_metadata('test/iceberg/snap-3776207205136740581-1-cf3d0be5-cf70-453d-ad8f-48fdc412e608.avro') where key = 'avro.codec';
 ----
 avro.codec	deflate
+
+query I
+from read_avro('test/reader/binary_metadata.avro');
+----
+1
+
+statement error
+from avro_metadata('test/reader/binary_metadata.avro');
+----
+Avro file "test/reader/binary_metadata.avro" has a metadata value for "user.binary" that is not valid UTF-8

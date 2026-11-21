@@ -45,6 +45,11 @@ SELECT count(*) FROM read_avro('{TEST_DIR}/filter.avro') WHERE id > 1000000
 ----
 0
 
+query I
+SELECT count(*) FROM read_avro('{TEST_DIR}/filter.avro') WHERE id < 0 AND s = 'value_1'
+----
+0
+
 query II
 SELECT count(*), sum(id) FROM read_avro('{TEST_DIR}/filter.avro')
 ----

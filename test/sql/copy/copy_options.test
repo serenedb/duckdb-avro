@@ -1,0 +1,29 @@
+# name: test/sql/copy/copy_options.test
+# description: COPY ... TO (FORMAT AVRO) overwrites an existing file in place without a temporary file, and rotates gzip-compressed files by their compressed size
+# group: [copy]
+
+require avro
+
+statement ok
+COPY (SELECT 1 AS a) TO '{TEST_DIR}/copy_options_overwrite.avro' (FORMAT AVRO);
+
+statement ok
+COPY (SELECT 2 AS a) TO '{TEST_DIR}/copy_options_overwrite.avro' (FORMAT AVRO, USE_TMP_FILE false);
+
+query I
+SELECT a FROM read_avro('{TEST_DIR}/copy_options_overwrite.avro');
+----
+2
+
+statement ok
+COPY (SELECT i AS id, 'row ' || i::VARCHAR AS s FROM range(20000) t(i)) TO '{TEST_DIR}/copy_options_rotated' (FORMAT AVRO, FILE_SIZE_BYTES '10KB', FILE_EXTENSION 'avro.gz');
+
+query II
+SELECT count(*), sum(id) FROM read_avro('{TEST_DIR}/copy_options_rotated/*.avro.gz');
+----
+20000	199990000
+
+query I
+SELECT count(*) FROM (SELECT id, s FROM read_avro('{TEST_DIR}/copy_options_rotated/*.avro.gz') EXCEPT SELECT i, 'row ' || i::VARCHAR FROM range(20000) t(i));
+----
+0
