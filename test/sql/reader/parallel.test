@@ -1,0 +1,87 @@
+# name: test/sql/reader/parallel.test
+# description: read_avro splits one file of 1279 blocks across threads without losing, repeating or mixing up rows
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/parallel.avro'))
+----
+id	BIGINT
+word	VARCHAR
+nums	INTEGER[]
+opt	BIGINT
+
+statement ok
+SET threads=8
+
+query IIIII
+SELECT count(*), count(DISTINCT id), sum(id), min(id), max(id) FROM read_avro('test/reader/parallel.avro')
+----
+300000	300000	44999850000	0	299999
+
+query IIII
+SELECT count(DISTINCT word), min(word), max(word), sum(length(word)) FROM read_avro('test/reader/parallel.avro')
+----
+7919	w0	w999	1457820
+
+query IIII
+SELECT sum(len(nums)), sum(list_sum(nums)), count(opt), sum(opt) FROM read_avro('test/reader/parallel.avro')
+----
+600000	300900000	200000	90000000000
+
+query I
+SELECT count(*) FROM read_avro('test/reader/parallel.avro')
+WHERE word <> 'w' || (id % 7919)::VARCHAR
+	OR len(nums) <> id % 5
+	OR (len(nums) > 0 AND (nums[1] <> id % 1000 OR nums[len(nums)] <> id % 1000 + len(nums) - 1))
+	OR (opt IS NULL) <> (id % 3 = 0)
+	OR opt <> id * 3
+----
+0
+
+query IIII
+SELECT * FROM read_avro('test/reader/parallel.avro') WHERE id IN (0, 1, 7919, 149999, 299999) ORDER BY id
+----
+0	w0	[]	NULL
+1	w1	[1]	3
+7919	w0	[919, 920, 921, 922]	23757
+149999	w7457	[999, 1000, 1001, 1002]	449997
+299999	w6996	[999, 1000, 1001, 1002]	899997
+
+statement ok
+SET threads=1
+
+query IIIII
+SELECT count(*), count(DISTINCT id), sum(id), min(id), max(id) FROM read_avro('test/reader/parallel.avro')
+----
+300000	300000	44999850000	0	299999
+
+query IIII
+SELECT count(DISTINCT word), min(word), max(word), sum(length(word)) FROM read_avro('test/reader/parallel.avro')
+----
+7919	w0	w999	1457820
+
+query IIII
+SELECT sum(len(nums)), sum(list_sum(nums)), count(opt), sum(opt) FROM read_avro('test/reader/parallel.avro')
+----
+600000	300900000	200000	90000000000
+
+query I
+SELECT count(*) FROM read_avro('test/reader/parallel.avro')
+WHERE word <> 'w' || (id % 7919)::VARCHAR
+	OR len(nums) <> id % 5
+	OR (len(nums) > 0 AND (nums[1] <> id % 1000 OR nums[len(nums)] <> id % 1000 + len(nums) - 1))
+	OR (opt IS NULL) <> (id % 3 = 0)
+	OR opt <> id * 3
+----
+0
+
+query IIII
+SELECT * FROM read_avro('test/reader/parallel.avro') WHERE id IN (0, 1, 7919, 149999, 299999) ORDER BY id
+----
+0	w0	[]	NULL
+1	w1	[1]	3
+7919	w0	[919, 920, 921, 922]	23757
+149999	w7457	[999, 1000, 1001, 1002]	449997
+299999	w6996	[999, 1000, 1001, 1002]	899997

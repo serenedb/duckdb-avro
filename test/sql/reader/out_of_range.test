@@ -1,0 +1,47 @@
+# name: test/sql/reader/out_of_range.test
+# description: read_avro rejects logical type values DuckDB types cannot hold - times outside a day, timestamp-millis overflowing microseconds, durations above INT32_MAX months
+# group: [reader]
+
+require avro
+
+statement error
+SELECT * FROM read_avro('test/reader/out_of_range_time_negative.avro')
+----
+a time value is outside of a day
+
+statement error
+SELECT * FROM read_avro('test/reader/out_of_range_time_millis.avro')
+----
+a time value is outside of a day
+
+statement error
+SELECT * FROM read_avro('test/reader/out_of_range_time_micros.avro')
+----
+a time value is outside of a day
+
+statement error
+SELECT * FROM read_avro('test/reader/out_of_range_timestamp_millis.avro')
+----
+a timestamp-millis value is out of range
+
+statement error
+SELECT * FROM read_avro('test/reader/out_of_range_duration.avro')
+----
+a duration is out of range
+
+# the boundary values themselves are valid: a time of exactly one day is 24:00:00
+query IIIII
+SELECT id, t_ms, t_us, ts_ms, dur FROM read_avro('test/reader/out_of_range_time_negative.avro') WHERE id = 0
+----
+0	24:00:00	24:00:00	1970-01-01 00:00:00	00:00:00
+
+# a column that is not read is not checked
+query I
+SELECT count(*) FROM read_avro('test/reader/out_of_range_duration.avro')
+----
+2
+
+query I
+SELECT max(id) FROM read_avro('test/reader/out_of_range_timestamp_millis.avro')
+----
+1

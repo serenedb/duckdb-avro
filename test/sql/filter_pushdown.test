@@ -1,0 +1,75 @@
+# name: test/sql/filter_pushdown.test
+# description: filters pushed into read_avro decode the filtered columns first and the others only for surviving rows
+# group: [sql]
+
+require avro
+
+statement ok
+SET threads=4
+
+statement ok
+COPY (SELECT i AS id, 'value_' || i AS s, CASE WHEN i % 10 = 0 THEN NULL ELSE [i, i + 1] END AS l, {'a': i % 3, 'b': 'x' || (i % 5)} AS r, (i % 7)::DOUBLE AS d FROM range(300000) t(i)) TO '{TEST_DIR}/filter.avro' (FORMAT avro, CODEC 'deflate');
+
+query II
+EXPLAIN SELECT s FROM read_avro('{TEST_DIR}/filter.avro') WHERE id = 123456
+----
+physical_plan	<REGEX>:.*Column Filter: id = 123456.*
+
+query IIIII
+SELECT * FROM read_avro('{TEST_DIR}/filter.avro') WHERE id = 123456
+----
+123456	value_123456	[123456, 123457]	{'a': 0, 'b': x1}	4.0
+
+query IIII
+SELECT count(*), sum(id), count(l), max(s) FROM read_avro('{TEST_DIR}/filter.avro') WHERE id BETWEEN 1000 AND 1999
+----
+1000	1499500	900	value_1999
+
+query II
+SELECT count(*), sum(id) FROM read_avro('{TEST_DIR}/filter.avro') WHERE s = 'value_77' OR s = 'value_299999'
+----
+2	300076
+
+query III
+SELECT count(*), count(DISTINCT s), sum(len(l)) FROM read_avro('{TEST_DIR}/filter.avro') WHERE d = 3 AND id < 70
+----
+10	10	18
+
+query II
+SELECT count(*), min(id) FROM read_avro('{TEST_DIR}/filter.avro') WHERE l IS NULL
+----
+30000	0
+
+query I
+SELECT count(*) FROM read_avro('{TEST_DIR}/filter.avro') WHERE id > 1000000
+----
+0
+
+query II
+SELECT count(*), sum(id) FROM read_avro('{TEST_DIR}/filter.avro')
+----
+300000	44999850000
+
+# file_row_number identifies every record: distinct and increasing within the file
+query III
+SELECT count(*), count(DISTINCT file_row_number), bool_and(file_row_number >= 0) FROM read_avro('{TEST_DIR}/filter.avro')
+----
+300000	300000	true
+
+query I
+SELECT count(*) FROM (SELECT id, file_row_number, lag(file_row_number) OVER (ORDER BY id) AS previous FROM read_avro('{TEST_DIR}/filter.avro')) WHERE previous >= file_row_number
+----
+0
+
+query II
+SELECT count(*), sum(id) FROM read_avro('{TEST_DIR}/filter.avro') WHERE file_row_number >= (SELECT file_row_number FROM read_avro('{TEST_DIR}/filter.avro') WHERE id = 299990)
+----
+10	2999945
+
+statement ok
+SET threads=1
+
+query II
+SELECT count(*), sum(id) FROM read_avro('{TEST_DIR}/filter.avro') WHERE id % 3 = 1
+----
+100000	14999950000
