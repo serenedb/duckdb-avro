@@ -509,7 +509,9 @@ string CreateJSONSchema(const AvroWriteSchema &root) {
 void VerifyFieldNames(const AvroWriteSchema &schema) {
 	for (auto &child : schema.children) {
 		if (schema.type.id() == LogicalTypeId::STRUCT && !IsAvroIdentifier(child.field)) {
-			throw InvalidInputException("Invalid Avro identifier");
+			throw InvalidInputException("Invalid Avro identifier \"%s\": field names have to match the regex "
+			                            "[A-Za-z_][A-Za-z0-9_]*, or set SANITIZE_FIELD_NAMES",
+			                            child.field);
 		}
 		VerifyFieldNames(child);
 	}
