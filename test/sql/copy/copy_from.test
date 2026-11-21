@@ -1,0 +1,57 @@
+# name: test/sql/copy/copy_from.test
+# description: COPY ... FROM reads Avro files into a table, ignoring the options only COPY ... TO uses
+# group: [copy]
+
+require avro
+
+statement ok
+COPY (SELECT i AS id, 'name_' || i AS name, [i, i * 2] AS pair FROM range(5000) t(i)) TO '{TEST_DIR}/copy_from.avro' (FORMAT avro, CODEC 'zstandard');
+
+statement ok
+CREATE TABLE target (id BIGINT, name VARCHAR, pair BIGINT[]);
+
+statement ok
+COPY target FROM '{TEST_DIR}/copy_from.avro' (FORMAT avro);
+
+query IIII
+SELECT count(*), sum(id), count(DISTINCT name), sum(pair[2]) FROM target
+----
+5000	12497500	5000	24995000
+
+# the options of COPY ... TO, as EXPORT DATABASE writes them, do not stop the file from being read back
+statement ok
+COPY target FROM '{TEST_DIR}/copy_from.avro' (FORMAT avro, CODEC 'deflate', ROOT_NAME 'r');
+
+query I
+SELECT count(*) FROM target
+----
+10000
+
+# columns are matched by position, as for every format COPY ... FROM reads
+statement ok
+CREATE TABLE narrow (name VARCHAR, id BIGINT);
+
+statement error
+COPY narrow FROM '{TEST_DIR}/copy_from.avro' (FORMAT avro);
+----
+<REGEX>:.*column count mismatch: expected 2 columns but found 3.*File schema: id BIGINT, name VARCHAR, pair BIGINT\[\].*FROM read_avro\(\.\.\.\).*
+
+statement ok
+INSERT INTO narrow SELECT name, id FROM read_avro('{TEST_DIR}/copy_from.avro') WHERE id = 4999;
+
+query II
+SELECT name, id FROM narrow
+----
+name_4999	4999
+
+statement ok
+CREATE TABLE users_table (name VARCHAR, favorite_number INTEGER, favorite_color VARCHAR);
+
+statement ok
+COPY users_table FROM 'test/users.avro';
+
+query III
+SELECT * FROM users_table ORDER BY name
+----
+Alyssa	256	NULL
+Ben	7	red
