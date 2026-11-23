@@ -3,6 +3,7 @@
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "avro_metadata.hpp"
 #include <avro.h>
 
@@ -12,6 +13,7 @@ static unique_ptr<FunctionData> AvroMetadataBind(ClientContext &context, TableFu
                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<AvroMetadataBindData>();
 	result->file_path = input.inputs[0].ToString();
+	context.CheckFileAccess(result->file_path, RoleCapability::ReadServerFiles);
 
 	names.emplace_back("key");
 	return_types.emplace_back(LogicalType::VARCHAR);
