@@ -896,6 +896,34 @@ AvroReaderGlobal::AvroReaderGlobal(ClientContext &context_p, shared_ptr<AvroSour
 	ranges =
 	    make_uniq<RowRanges>(BufferAllocator::Get(context), source->Rows(), header.size, source->Size(), range_bytes);
 	ranges->path = source->Path();
+	if (!source->Stream() && ranges->RangeCount() > 1) {
+		chain_first.resize(ranges->RangeCount(), DConstants::INVALID_INDEX);
+		chain_end.resize(ranges->RangeCount(), DConstants::INVALID_INDEX);
+	}
+}
+
+idx_t AvroReaderGlobal::FinishBlocks(idx_t range, idx_t first_block, idx_t blocks_end) {
+	ranges->Finish(range);
+	if (chain_first.empty()) {
+		return DConstants::INVALID_INDEX;
+	}
+	lock_guard<mutex> guard(chain_lock);
+	chain_first[range] = first_block;
+	chain_end[range] = blocks_end;
+	if (++chain_finished < chain_first.size()) {
+		return DConstants::INVALID_INDEX;
+	}
+	idx_t expected = ranges->start;
+	for (idx_t i = 0; i < chain_first.size(); i++) {
+		if (chain_first[i] == DConstants::INVALID_INDEX) {
+			continue;
+		}
+		if (chain_first[i] != expected) {
+			return expected;
+		}
+		expected = chain_end[i];
+	}
+	return expected == ranges->Size() ? DConstants::INVALID_INDEX : expected;
 }
 
 idx_t AvroReaderGlobal::MaxThreads() const {
@@ -953,6 +981,8 @@ void AvroReader::Load() {
 	block_left = 0;
 	cursor = nullptr;
 	block_end = nullptr;
+	first_block = DConstants::INVALID_INDEX;
+	blocks_end = DConstants::INVALID_INDEX;
 	if (ranges.Intake()) {
 		LoadIntake();
 		return;
@@ -1163,6 +1193,10 @@ bool AvroReader::NextBlock() {
 		searching = false;
 		block_offset = next_block;
 		next_block = data_start + size + AVRO_SYNC_SIZE;
+		if (first_block == DConstants::INVALID_INDEX) {
+			first_block = block_offset;
+		}
+		blocks_end = next_block;
 		global.source->Consume(next_block - block_offset);
 		if (count == 0) {
 			continue;
@@ -1369,8 +1403,12 @@ idx_t AvroReader::Scan(DataChunk &output) {
 		}
 		const idx_t rows = Fill(output);
 		if (rows == 0) {
-			global.Finish(range);
+			const idx_t gap = global.FinishBlocks(range, first_block, blocks_end);
 			claimed = false;
+			if (gap != DConstants::INVALID_INDEX) {
+				block_offset = gap;
+				ThrowCorrupt("a block is truncated or does not end with the file's sync marker");
+			}
 			return 0;
 		}
 		const idx_t count = Complete(output, rows);

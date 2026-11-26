@@ -158,6 +158,7 @@ public:
 	void Finish(idx_t range) {
 		ranges->Finish(range);
 	}
+	idx_t FinishBlocks(idx_t range, idx_t first_block, idx_t blocks_end);
 	double Progress() const {
 		return source->Progress();
 	}
@@ -173,6 +174,12 @@ public:
 	idx_t stream_bytes = 0;
 	idx_t deferred = 0;
 	bool walk = false;
+
+private:
+	mutex chain_lock;
+	vector<idx_t> chain_first;
+	vector<idx_t> chain_end;
+	idx_t chain_finished = 0;
 };
 
 class AvroReader {
@@ -231,6 +238,8 @@ private:
 	bool loaded = false;
 	bool searching = false;
 	idx_t block_offset = 0;
+	idx_t first_block = DConstants::INVALID_INDEX;
+	idx_t blocks_end = DConstants::INVALID_INDEX;
 	idx_t block_left = 0;
 	idx_t record_index = 0;
 	const char *cursor = nullptr;
