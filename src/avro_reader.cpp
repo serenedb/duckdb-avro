@@ -885,8 +885,8 @@ AvroReaderGlobal::AvroReaderGlobal(ClientContext &context_p, shared_ptr<AvroSour
 	const auto &header = source->header;
 	idx_t range_bytes = DConstants::INVALID_INDEX;
 	if (!source->Stream() && TaskScheduler::QueryThreads(context) > 1) {
-		const idx_t threads = MaxValue<idx_t>(TaskScheduler::QueryThreads(context), 1);
-		range_bytes = MinValue(MAX_RANGE_BYTES, MaxValue(MIN_RANGE_BYTES, source->Size() / threads));
+		range_bytes = RowRanges::RangeBytes(source->Size(), TaskScheduler::QueryThreads(context), MIN_RANGE_BYTES,
+		                                    MAX_RANGE_BYTES);
 	}
 	ranges =
 	    make_uniq<RowRanges>(BufferAllocator::Get(context), source->Rows(), header.size, source->Size(), range_bytes);
