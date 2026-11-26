@@ -884,7 +884,12 @@ AvroReaderGlobal::AvroReaderGlobal(ClientContext &context_p, shared_ptr<AvroSour
 	}
 	const auto &header = source->header;
 	idx_t range_bytes = DConstants::INVALID_INDEX;
-	if (!source->Stream() && TaskScheduler::QueryThreads(context) > 1) {
+	if (source->Stream()) {
+		stream_bytes = RowInput::StreamBytes(source->HostStream());
+		if (TaskScheduler::QueryThreads(context) > 1) {
+			range_bytes = stream_bytes;
+		}
+	} else if (TaskScheduler::QueryThreads(context) > 1) {
 		range_bytes = RowRanges::RangeBytes(source->Size(), TaskScheduler::QueryThreads(context), MIN_RANGE_BYTES,
 		                                    MAX_RANGE_BYTES);
 	}
@@ -894,6 +899,9 @@ AvroReaderGlobal::AvroReaderGlobal(ClientContext &context_p, shared_ptr<AvroSour
 }
 
 idx_t AvroReaderGlobal::MaxThreads() const {
+	if (ranges->Intake()) {
+		return TaskScheduler::QueryThreads(context);
+	}
 	return ranges->RangeCount();
 }
 
@@ -908,6 +916,12 @@ AvroReader::AvroReader(AvroReaderGlobal &global_p)
 	targets.resize(global.fields.size());
 }
 
+AvroReader::~AvroReader() {
+	if (claimed && !loaded && global.ranges->Intake()) {
+		global.ranges->FailIntake();
+	}
+}
+
 bool AvroReader::Claim() {
 	claimed = false;
 	if (!global.Claim(range)) {
@@ -919,6 +933,9 @@ bool AvroReader::Claim() {
 }
 
 idx_t AvroReader::Ensure(idx_t from, idx_t to) {
+	if (global.ranges->Intake()) {
+		return window.read_to;
+	}
 	while (window.read_to < to && window.read_to < global.ranges->Size()) {
 		const idx_t before = window.read_to;
 		const idx_t ahead = range_end > window.read_to ? MinValue(READ_BYTES, range_end - window.read_to) : 0;
@@ -933,11 +950,15 @@ idx_t AvroReader::Ensure(idx_t from, idx_t to) {
 void AvroReader::Load() {
 	loaded = true;
 	auto &ranges = *global.ranges;
-	const idx_t begin = ranges.RangeBegin(range);
-	range_end = ranges.RangeEnd(range);
 	block_left = 0;
 	cursor = nullptr;
 	block_end = nullptr;
+	if (ranges.Intake()) {
+		LoadIntake();
+		return;
+	}
+	const idx_t begin = ranges.RangeBegin(range);
+	range_end = ranges.RangeEnd(range);
 	if (begin == ranges.start) {
 		window.Start(begin, true);
 		next_block = begin;
@@ -950,6 +971,78 @@ void AvroReader::Load() {
 	if (!FindSync(next_block)) {
 		next_block = range_end;
 	}
+}
+
+void AvroReader::LoadIntake() {
+	auto &ranges = *global.ranges;
+	idx_t from;
+	if (!ranges.ClaimRead(range, from)) {
+		claimed = false;
+		return;
+	}
+	bool cut = false;
+	try {
+		window.StartAhead(from);
+		while (window.read_to - from < global.stream_bytes && window.read_to < ranges.Size()) {
+			window.Read(window.bytes->offset, global.stream_bytes - (window.read_to - from));
+		}
+		ranges.PassRead(window.read_to);
+		RowClaim claim;
+		if (!ranges.ClaimCut(range, claim)) {
+			cut = true;
+			claimed = false;
+			return;
+		}
+		window.Prepend(std::move(claim.carry), claim.begin, from);
+		idx_t end = CutBlocks(claim.begin);
+		if (window.read_to >= ranges.Size()) {
+			end = window.read_to;
+		} else if (end == claim.begin) {
+			ranges.CarryOn(std::move(window.bytes), window.read_to, RowSearch(), false);
+			cut = true;
+			window.read_to = claim.begin;
+			global.Finish(range);
+			claimed = false;
+			return;
+		}
+		ranges.Cut(end, window.Tail(end), window.read_to, CSVState::RECORD_SEPARATOR, DConstants::INVALID_INDEX);
+		cut = true;
+		next_block = claim.begin;
+		range_end = end;
+		searching = false;
+	} catch (...) {
+		if (!cut) {
+			ranges.FailIntake();
+		}
+		throw;
+	}
+}
+
+idx_t AvroReader::CutBlocks(idx_t begin) const {
+	idx_t end = begin;
+	while (end < window.read_to) {
+		const char *start = At(end);
+		const char *pos = start;
+		const char *limit = At(window.read_to);
+		int64_t count;
+		int64_t size;
+		if (!AvroReadLong(pos, count) || pos > limit || !AvroReadLong(pos, size) || pos > limit) {
+			return end;
+		}
+		if (count < 0 || size < 0) {
+			return window.read_to;
+		}
+		const idx_t data_start = end + static_cast<idx_t>(pos - start);
+		const auto length = static_cast<idx_t>(size);
+		if (length > window.read_to - data_start || window.read_to - data_start - length < AVRO_SYNC_SIZE) {
+			return end;
+		}
+		end = data_start + length + AVRO_SYNC_SIZE;
+		if (memcmp(At(end - AVRO_SYNC_SIZE), header.sync, AVRO_SYNC_SIZE) != 0) {
+			return end;
+		}
+	}
+	return end;
 }
 
 bool AvroReader::FindSync(idx_t &position) {
@@ -1268,6 +1361,9 @@ idx_t AvroReader::Scan(DataChunk &output) {
 		pins.clear();
 		if (!loaded) {
 			Load();
+			if (!claimed) {
+				return 0;
+			}
 		} else if (block_left != 0 && block_bytes) {
 			Pin(block_bytes);
 		}

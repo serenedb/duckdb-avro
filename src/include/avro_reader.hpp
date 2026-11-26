@@ -38,6 +38,9 @@ public:
 	bool Stream() const {
 		return input->stream;
 	}
+	bool HostStream() const {
+		return input->host_stream != nullptr;
+	}
 	void ReadInOrder();
 	void Consume(idx_t bytes) {
 		consumed += bytes;
@@ -167,6 +170,7 @@ public:
 	unique_ptr<AvroNode> root_union;
 	idx_t record_branch = 0;
 	unique_ptr<RowRanges> ranges;
+	idx_t stream_bytes = 0;
 	idx_t deferred = 0;
 	bool walk = false;
 };
@@ -174,6 +178,7 @@ public:
 class AvroReader {
 public:
 	explicit AvroReader(AvroReaderGlobal &global);
+	~AvroReader();
 
 	bool Claim();
 	bool Claimed() const {
@@ -187,6 +192,8 @@ public:
 
 private:
 	void Load();
+	void LoadIntake();
+	idx_t CutBlocks(idx_t begin) const;
 	bool NextBlock();
 	bool FindSync(idx_t &position);
 	idx_t Ensure(idx_t from, idx_t to);
