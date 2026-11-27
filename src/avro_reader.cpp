@@ -1004,48 +1004,25 @@ void AvroReader::Load() {
 }
 
 void AvroReader::LoadIntake() {
-	auto &ranges = *global.ranges;
-	idx_t from;
-	if (!ranges.ClaimRead(range, from)) {
+	RowIntake intake(window);
+	if (!intake.Start(range, global.stream_bytes)) {
 		claimed = false;
 		return;
 	}
-	bool cut = false;
-	try {
-		window.StartAhead(from);
-		while (window.read_to - from < global.stream_bytes && window.read_to < ranges.Size()) {
-			window.Read(window.bytes->offset, global.stream_bytes - (window.read_to - from));
-		}
-		ranges.PassRead(window.read_to);
-		RowClaim claim;
-		if (!ranges.ClaimCut(range, claim)) {
-			cut = true;
-			claimed = false;
-			return;
-		}
-		window.Prepend(std::move(claim.carry), claim.begin, from);
-		idx_t end = CutBlocks(claim.begin);
-		if (window.read_to >= ranges.Size()) {
-			end = window.read_to;
-		} else if (end == claim.begin) {
-			ranges.CarryOn(std::move(window.bytes), window.read_to, RowSearch(), false);
-			cut = true;
-			window.read_to = claim.begin;
-			global.Finish(range);
-			claimed = false;
-			return;
-		}
-		ranges.Cut(end, window.Tail(end), window.read_to, CSVState::RECORD_SEPARATOR, DConstants::INVALID_INDEX);
-		cut = true;
-		next_block = claim.begin;
-		range_end = end;
-		searching = false;
-	} catch (...) {
-		if (!cut) {
-			ranges.FailIntake();
-		}
-		throw;
+	const idx_t begin = intake.claim.begin;
+	idx_t end = CutBlocks(begin);
+	if (window.read_to >= global.ranges->Size()) {
+		end = window.read_to;
+	} else if (end == begin) {
+		intake.CarryOn(RowSearch());
+		global.Finish(range);
+		claimed = false;
+		return;
 	}
+	intake.Cut(end);
+	next_block = begin;
+	range_end = end;
+	searching = false;
 }
 
 idx_t AvroReader::CutBlocks(idx_t begin) const {
