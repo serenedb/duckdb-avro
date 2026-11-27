@@ -1284,16 +1284,6 @@ void WriteAvroFinalize(ClientContext &context, FunctionData &bind_data, GlobalFu
 	gstate.Cast<WriteAvroGlobalState>().Finalize();
 }
 
-CopyFunctionExecutionMode WriteAvroExecutionMode(bool preserve_insertion_order, bool supports_batch_index) {
-	if (!preserve_insertion_order) {
-		return CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
-	}
-	if (supports_batch_index) {
-		return CopyFunctionExecutionMode::BATCH_COPY_TO_FILE;
-	}
-	return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
-}
-
 unique_ptr<PreparedBatchData> WriteAvroPrepareBatch(ClientContext &context, FunctionData &bind_data,
                                                     GlobalFunctionData &gstate,
                                                     unique_ptr<ColumnDataCollection> collection) {
@@ -1345,7 +1335,7 @@ CopyFunction AvroCopyFunction::Create() {
 	function.copy_to_sink = WriteAvroSink;
 	function.copy_to_combine = WriteAvroCombine;
 	function.copy_to_finalize = WriteAvroFinalize;
-	function.execution_mode = WriteAvroExecutionMode;
+	function.execution_mode = CopyFunction::ParallelUnlessOrdered;
 	function.prepare_batch = WriteAvroPrepareBatch;
 	function.flush_batch = WriteAvroFlushBatch;
 	function.file_size_bytes = WriteAvroFileSizeBytes;
