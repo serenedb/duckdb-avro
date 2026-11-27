@@ -3,16 +3,13 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/numeric_utils.hpp"
-#include "snappy.h"
+
+#define ZLIB_CONST
+#include <zlib.h>
 
 namespace duckdb {
 
 namespace {
-
-constexpr idx_t MIN_DECOMPRESS_BYTES = 64 * 1024;
-constexpr idx_t ZSTD_MAX_EXPANSION = 128 * 1024 / 4;
-constexpr idx_t SNAPPY_COPY_BYTES = 3;
-constexpr idx_t SNAPPY_MAX_COPY = 64;
 
 class HeaderReader {
 public:
@@ -82,15 +79,21 @@ void StoreBigEndian(uint32_t value, data_ptr_t out) {
 	out[3] = static_cast<uint8_t>(value);
 }
 
-uInt StreamBytes(idx_t size) {
-	if (size > NumericLimits<uInt>::Maximum()) {
-		throw InvalidInputException("Avro block of %llu bytes is too large to compress or decompress", size);
-	}
-	return static_cast<uInt>(size);
+[[noreturn]] void ThrowCorrupt(AvroCodec codec, const string &detail) {
+	throw InvalidInputException("Avro %s block is corrupt: %s", string(AvroCodecName(codec)), detail);
 }
 
-[[noreturn]] void ThrowCorrupt(AvroCodec codec, const char *detail) {
-	throw InvalidInputException("Avro %s block is corrupt: %s", string(AvroCodecName(codec)), detail);
+BlockCodec AvroBlockCodec(AvroCodec codec) {
+	switch (codec) {
+	case AvroCodec::DEFLATE:
+		return BlockCodec::DEFLATE;
+	case AvroCodec::SNAPPY:
+		return BlockCodec::SNAPPY;
+	case AvroCodec::ZSTANDARD:
+		return BlockCodec::ZSTD;
+	default:
+		throw InternalException("An Avro block without a codec reached the block codecs");
+	}
 }
 
 } // namespace
@@ -198,143 +201,29 @@ void AvroWriteHeader(const vector<AvroMetadataEntry> &metadata, const char *sync
 AvroDecompressor::AvroDecompressor(Allocator &allocator_p) : allocator(allocator_p) {
 }
 
-AvroDecompressor::~AvroDecompressor() {
-	if (inflate_ready) {
-		inflateEnd(&inflate_stream);
-	}
-	if (zstd) {
-		ZSTD_freeDCtx(zstd);
-	}
-}
-
-data_ptr_t AvroDecompressor::Reserve(AllocatedData &out, idx_t used, idx_t need) {
-	const idx_t want = used + need + AVRO_PADDING;
-	if (out.GetSize() < want) {
-		auto grown = allocator.Allocate(MaxValue(want, out.GetSize() * 2));
-		if (used) {
-			memcpy(grown.get(), out.get(), used);
-		}
-		out = std::move(grown);
-	}
-	return out.get();
-}
-
 idx_t AvroDecompressor::Decompress(AvroCodec codec, const char *data, idx_t size, AllocatedData &out) {
-	idx_t result;
-	switch (codec) {
-	case AvroCodec::DEFLATE:
-		result = Inflate(data, size, out);
-		break;
-	case AvroCodec::SNAPPY:
-		result = Snappy(data, size, out);
-		break;
-	case AvroCodec::ZSTANDARD:
-		result = Zstandard(data, size, out);
-		break;
-	default:
-		throw InternalException("Avro block without a codec reached the decompressor");
-	}
-	memset(out.get() + result, 0, AVRO_PADDING);
-	return result;
-}
-
-idx_t AvroDecompressor::Inflate(const char *data, idx_t size, AllocatedData &out) {
-	if (!inflate_ready) {
-		memset(&inflate_stream, 0, sizeof(inflate_stream));
-		if (inflateInit2(&inflate_stream, -MAX_WBITS) != Z_OK) {
-			throw InternalException("Failed to initialize the Avro deflate decoder");
+	auto compressed = size;
+	if (codec == AvroCodec::SNAPPY) {
+		if (size < sizeof(uint32_t)) {
+			ThrowCorrupt(codec, "the block is shorter than its checksum");
 		}
-		inflate_ready = true;
-	} else if (inflateReset(&inflate_stream) != Z_OK) {
-		throw InternalException("Failed to reset the Avro deflate decoder");
+		compressed -= sizeof(uint32_t);
 	}
-	inflate_stream.next_in = reinterpret_cast<const Bytef *>(data);
-	inflate_stream.avail_in = StreamBytes(size);
-	idx_t used = 0;
-	idx_t chunk = MaxValue(size * 4, MIN_DECOMPRESS_BYTES);
-	while (true) {
-		const uInt room = StreamBytes(chunk);
-		auto base = Reserve(out, used, room);
-		inflate_stream.next_out = base + used;
-		inflate_stream.avail_out = room;
-		const int ret = inflate(&inflate_stream, Z_NO_FLUSH);
-		used += room - inflate_stream.avail_out;
-		if (ret == Z_STREAM_END) {
-			return used;
-		}
-		if (ret != Z_OK && ret != Z_BUF_ERROR) {
-			ThrowCorrupt(AvroCodec::DEFLATE, inflate_stream.msg ? inflate_stream.msg : zError(ret));
-		}
-		if (inflate_stream.avail_in == 0 && inflate_stream.avail_out != 0) {
-			ThrowCorrupt(AvroCodec::DEFLATE, "the compressed data ends early");
-		}
-		chunk = MaxValue(chunk, used);
+	idx_t length;
+	string error;
+	if (!decompressor.TryDecompress(AvroBlockCodec(codec), const_data_ptr_cast(data), compressed, allocator,
+	                                AVRO_PADDING, out, length, error)) {
+		ThrowCorrupt(codec, error);
 	}
-}
-
-idx_t AvroDecompressor::Snappy(const char *data, idx_t size, AllocatedData &out) {
-	if (size < sizeof(uint32_t)) {
-		ThrowCorrupt(AvroCodec::SNAPPY, "the block is shorter than its checksum");
-	}
-	const idx_t compressed = size - sizeof(uint32_t);
-	size_t length;
-	if (!duckdb_snappy::GetUncompressedLength(data, compressed, &length) ||
-	    length > (compressed / SNAPPY_COPY_BYTES + 1) * SNAPPY_MAX_COPY) {
-		ThrowCorrupt(AvroCodec::SNAPPY, "invalid uncompressed length");
-	}
-	auto base = Reserve(out, 0, length);
-	if (!duckdb_snappy::RawUncompress(data, compressed, char_ptr_cast(base))) {
-		ThrowCorrupt(AvroCodec::SNAPPY, "invalid compressed data");
-	}
-	if (crc32_z(0, base, length) != LoadBigEndian(data + compressed)) {
-		ThrowCorrupt(AvroCodec::SNAPPY, "CRC32 checksum mismatch");
+	if (codec == AvroCodec::SNAPPY && crc32_z(0, out.get(), length) != LoadBigEndian(data + compressed)) {
+		ThrowCorrupt(codec, "CRC32 checksum mismatch");
 	}
 	return length;
 }
 
-idx_t AvroDecompressor::Zstandard(const char *data, idx_t size, AllocatedData &out) {
-	if (!zstd) {
-		zstd = ZSTD_createDCtx();
-		if (!zstd) {
-			throw OutOfMemoryException("Failed to allocate the Avro zstandard decoder");
-		}
-	} else {
-		ZSTD_DCtx_reset(zstd, ZSTD_reset_session_only);
-	}
-	const auto known = ZSTD_getFrameContentSize(data, size);
-	idx_t chunk =
-	    known / ZSTD_MAX_EXPANSION <= size ? MaxValue<idx_t>(known, 1) : MaxValue(size * 4, MIN_DECOMPRESS_BYTES);
-	ZSTD_inBuffer input {data, size, 0};
-	idx_t used = 0;
-	while (true) {
-		auto base = Reserve(out, used, chunk);
-		ZSTD_outBuffer output {base, used + chunk, used};
-		const size_t ret = ZSTD_decompressStream(zstd, &output, &input);
-		if (ZSTD_isError(ret)) {
-			ThrowCorrupt(AvroCodec::ZSTANDARD, ZSTD_getErrorName(ret));
-		}
-		used = output.pos;
-		if (input.pos == input.size) {
-			if (ret == 0) {
-				return used;
-			}
-			if (output.pos < output.size) {
-				ThrowCorrupt(AvroCodec::ZSTANDARD, "the compressed data ends early");
-			}
-		}
-		chunk = MaxValue(chunk, used);
-	}
-}
-
 AvroCompressor::AvroCompressor(Allocator &allocator_p, AvroCodec codec_p) : allocator(allocator_p), codec(codec_p) {
-}
-
-AvroCompressor::~AvroCompressor() {
-	if (deflate_ready) {
-		deflateEnd(&deflate_stream);
-	}
-	if (zstd) {
-		ZSTD_freeCCtx(zstd);
+	if (codec != AvroCodec::NONE) {
+		compressor = make_uniq<BlockCompressor>(AvroBlockCodec(codec));
 	}
 }
 
@@ -346,56 +235,18 @@ data_ptr_t AvroCompressor::Reserve(idx_t need) {
 }
 
 std::string_view AvroCompressor::Compress(const char *data, idx_t size) {
-	switch (codec) {
-	case AvroCodec::NONE:
+	if (!compressor) {
 		return {data, size};
-	case AvroCodec::DEFLATE: {
-		if (!deflate_ready) {
-			memset(&deflate_stream, 0, sizeof(deflate_stream));
-			if (deflateInit2(&deflate_stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) !=
-			    Z_OK) {
-				throw InternalException("Failed to initialize the Avro deflate encoder");
-			}
-			deflate_ready = true;
-		} else if (deflateReset(&deflate_stream) != Z_OK) {
-			throw InternalException("Failed to reset the Avro deflate encoder");
-		}
-		const idx_t bound = deflateBound(&deflate_stream, StreamBytes(size));
-		auto base = Reserve(bound);
-		deflate_stream.next_in = reinterpret_cast<const Bytef *>(data);
-		deflate_stream.avail_in = StreamBytes(size);
-		deflate_stream.next_out = base;
-		deflate_stream.avail_out = StreamBytes(bound);
-		if (deflate(&deflate_stream, Z_FINISH) != Z_STREAM_END) {
-			throw InternalException("Avro deflate encoder did not finish its block");
-		}
-		return {const_char_ptr_cast(base), bound - deflate_stream.avail_out};
 	}
-	case AvroCodec::SNAPPY: {
-		const idx_t bound = duckdb_snappy::MaxCompressedLength(size);
-		auto base = Reserve(bound + sizeof(uint32_t));
-		size_t length;
-		duckdb_snappy::RawCompress(data, size, char_ptr_cast(base), &length);
-		StoreBigEndian(static_cast<uint32_t>(crc32_z(0, reinterpret_cast<const Bytef *>(data), size)), base + length);
-		return {const_char_ptr_cast(base), length + sizeof(uint32_t)};
+	const auto checksum = codec == AvroCodec::SNAPPY ? sizeof(uint32_t) : 0;
+	const auto bound = compressor->MaxCompressedSize(size);
+	auto base = Reserve(bound + checksum);
+	auto length = compressor->Compress(const_data_ptr_cast(data), size, base, bound);
+	if (checksum) {
+		StoreBigEndian(static_cast<uint32_t>(crc32_z(0, const_data_ptr_cast(data), size)), base + length);
+		length += checksum;
 	}
-	case AvroCodec::ZSTANDARD: {
-		if (!zstd) {
-			zstd = ZSTD_createCCtx();
-			if (!zstd) {
-				throw OutOfMemoryException("Failed to allocate the Avro zstandard encoder");
-			}
-		}
-		const idx_t bound = ZSTD_compressBound(size);
-		auto base = Reserve(bound);
-		const size_t length = ZSTD_compressCCtx(zstd, base, bound, data, size, ZSTD_CLEVEL_DEFAULT);
-		if (ZSTD_isError(length)) {
-			throw InternalException("Avro zstandard encoder failed: %s", ZSTD_getErrorName(length));
-		}
-		return {const_char_ptr_cast(base), length};
-	}
-	}
-	throw InternalException("Unknown Avro codec");
+	return {const_char_ptr_cast(base), length};
 }
 
 } // namespace duckdb

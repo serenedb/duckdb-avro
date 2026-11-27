@@ -11,10 +11,7 @@
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/vector.hpp"
-
-#define ZLIB_CONST
-#include <zlib.h>
-#include <zstd.h>
+#include "duckdb/formats/block_codecs.hpp"
 
 #include <string_view>
 
@@ -99,31 +96,17 @@ void AvroWriteHeader(const vector<AvroMetadataEntry> &metadata, const char *sync
 class AvroDecompressor {
 public:
 	explicit AvroDecompressor(Allocator &allocator);
-	~AvroDecompressor();
-	AvroDecompressor(const AvroDecompressor &) = delete;
-	AvroDecompressor &operator=(const AvroDecompressor &) = delete;
 
 	idx_t Decompress(AvroCodec codec, const char *data, idx_t size, AllocatedData &out);
 
 private:
-	data_ptr_t Reserve(AllocatedData &out, idx_t used, idx_t need);
-	idx_t Inflate(const char *data, idx_t size, AllocatedData &out);
-	idx_t Snappy(const char *data, idx_t size, AllocatedData &out);
-	idx_t Zstandard(const char *data, idx_t size, AllocatedData &out);
-
-private:
 	Allocator &allocator;
-	z_stream inflate_stream;
-	bool inflate_ready = false;
-	ZSTD_DCtx *zstd = nullptr;
+	BlockDecompressor decompressor;
 };
 
 class AvroCompressor {
 public:
 	AvroCompressor(Allocator &allocator, AvroCodec codec);
-	~AvroCompressor();
-	AvroCompressor(const AvroCompressor &) = delete;
-	AvroCompressor &operator=(const AvroCompressor &) = delete;
 
 	std::string_view Compress(const char *data, idx_t size);
 
@@ -133,9 +116,7 @@ private:
 private:
 	Allocator &allocator;
 	const AvroCodec codec;
-	z_stream deflate_stream;
-	bool deflate_ready = false;
-	ZSTD_CCtx *zstd = nullptr;
+	unique_ptr<BlockCompressor> compressor;
 	AllocatedData out;
 };
 
