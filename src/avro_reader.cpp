@@ -2,6 +2,7 @@
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/operator/multiply.hpp"
+#include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
@@ -44,17 +45,15 @@ constexpr int64_t MAX_EMPTY_ITEMS = int64_t(1) << 32;
 }
 
 [[gnu::always_inline]] inline void SkipLong(const char *&pos, const char *end) {
-	auto bytes = reinterpret_cast<const uint8_t *>(pos);
-	for (idx_t i = 0; i < AVRO_MAX_VARINT_SIZE; i++) {
-		if (bytes[i] < 0x80) {
-			pos += i + 1;
-			if (pos > end) {
-				ThrowData("a number runs past the end of its block");
-			}
-			return;
-		}
+	uint64_t skipped;
+	const auto size = EncodingUtil::TryDecodeUnsignedLEB128(const_data_ptr_cast(pos), AVRO_MAX_VARINT_SIZE, skipped);
+	if (size == 0) {
+		ThrowData("a number is malformed");
 	}
-	ThrowData("a number is malformed");
+	pos += size;
+	if (pos > end) {
+		ThrowData("a number runs past the end of its block");
+	}
 }
 
 inline int32_t ReadInt(const char *&pos, const char *end) {
@@ -230,81 +229,28 @@ void SetNull(Vector &target, idx_t row) {
 }
 
 template <class T>
-void StoreDecimal(int64_t value, Vector &target, idx_t row) {
-	if (value < NumericLimits<T>::Minimum() || value > NumericLimits<T>::Maximum()) {
+void DecodeDecimal(const char *data, idx_t size, Vector &target, idx_t row) {
+	if (!Decimal::TryDecodeBigEndian(const_data_ptr_cast(data), size,
+	                                 FlatVector::GetDataMutableUnsafe<T>(target)[row])) {
 		ThrowData("a decimal value does not fit its precision");
 	}
-	FlatVector::GetDataMutableUnsafe<T>(target)[row] = static_cast<T>(value);
 }
 
 void DecodeDecimal(const AvroNode &node, const char *data, idx_t size, Vector &target, idx_t row) {
-	auto bytes = reinterpret_cast<const uint8_t *>(data);
-	const bool negative = size != 0 && (bytes[0] & 0x80) != 0;
-	if (size <= sizeof(int64_t)) {
-		uint64_t value = negative ? NumericLimits<uint64_t>::Maximum() : 0;
-		for (idx_t i = 0; i < size; i++) {
-			value = (value << 8) | bytes[i];
-		}
-		const auto signed_value = static_cast<int64_t>(value);
-		switch (node.physical) {
-		case PhysicalType::INT16:
-			StoreDecimal<int16_t>(signed_value, target, row);
-			return;
-		case PhysicalType::INT32:
-			StoreDecimal<int32_t>(signed_value, target, row);
-			return;
-		case PhysicalType::INT64:
-			FlatVector::GetDataMutableUnsafe<int64_t>(target)[row] = signed_value;
-			return;
-		default:
-			FlatVector::GetDataMutableUnsafe<hugeint_t>(target)[row] = hugeint_t(signed_value);
-			return;
-		}
-	}
-	const uint8_t sign = negative ? 0xFF : 0x00;
-	idx_t skip = size > sizeof(hugeint_t) ? size - sizeof(hugeint_t) : 0;
-	for (idx_t i = 0; i < skip; i++) {
-		if (bytes[i] != sign) {
-			ThrowData("a decimal value does not fit its precision");
-		}
-	}
-	if (skip && ((bytes[skip] & 0x80) != 0) != negative) {
-		ThrowData("a decimal value does not fit its precision");
-	}
-	uint64_t upper = negative ? NumericLimits<uint64_t>::Maximum() : 0;
-	uint64_t lower = upper;
-	for (idx_t i = skip; i < size; i++) {
-		upper = (upper << 8) | (lower >> 56);
-		lower = (lower << 8) | bytes[i];
-	}
-	hugeint_t value;
-	value.upper = static_cast<int64_t>(upper);
-	value.lower = lower;
-	if (node.physical == PhysicalType::INT128) {
-		FlatVector::GetDataMutableUnsafe<hugeint_t>(target)[row] = value;
-		return;
-	}
-	int64_t narrow;
-	if (!Hugeint::TryCast<int64_t>(value, narrow)) {
-		ThrowData("a decimal value does not fit its precision");
-	}
 	switch (node.physical) {
 	case PhysicalType::INT16:
-		StoreDecimal<int16_t>(narrow, target, row);
+		DecodeDecimal<int16_t>(data, size, target, row);
 		return;
 	case PhysicalType::INT32:
-		StoreDecimal<int32_t>(narrow, target, row);
+		DecodeDecimal<int32_t>(data, size, target, row);
+		return;
+	case PhysicalType::INT64:
+		DecodeDecimal<int64_t>(data, size, target, row);
 		return;
 	default:
-		FlatVector::GetDataMutableUnsafe<int64_t>(target)[row] = narrow;
+		DecodeDecimal<hugeint_t>(data, size, target, row);
 		return;
 	}
-}
-
-uint32_t LoadLittleEndian(const char *data) {
-	auto bytes = reinterpret_cast<const uint8_t *>(data);
-	return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
-	       (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
 }
 
 void Decode(const AvroNode &node, const char *&pos, const char *end, Vector &target, idx_t row);
@@ -480,9 +426,9 @@ void Decode(const AvroNode &node, const char *&pos, const char *end, Vector &tar
 		return;
 	case AvroDecode::DURATION: {
 		Need(pos, end, node.size);
-		const uint32_t months = LoadLittleEndian(pos);
-		const uint32_t days = LoadLittleEndian(pos + 4);
-		const uint32_t millis = LoadLittleEndian(pos + 8);
+		const uint32_t months = LoadLE<uint32_t>(const_data_ptr_cast(pos));
+		const uint32_t days = LoadLE<uint32_t>(const_data_ptr_cast(pos + 4));
+		const uint32_t millis = LoadLE<uint32_t>(const_data_ptr_cast(pos + 8));
 		if (months > static_cast<uint32_t>(NumericLimits<int32_t>::Maximum()) ||
 		    days > static_cast<uint32_t>(NumericLimits<int32_t>::Maximum())) {
 			ThrowData("a duration is out of range");
@@ -799,8 +745,8 @@ AvroNode AvroNode::Plan(const AvroType &type) {
 		if (node.members[value] != DConstants::INVALID_INDEX && node.children[null].decode == AvroDecode::NULL_VALUE &&
 		    node.children[value].fast != AvroFast::NONE) {
 			node.fast = node.children[value].fast;
-			node.null_byte = static_cast<uint8_t>(AvroZigZagEncode(static_cast<int64_t>(null)));
-			node.value_byte = static_cast<uint8_t>(AvroZigZagEncode(static_cast<int64_t>(value)));
+			node.null_byte = static_cast<uint8_t>(EncodingUtil::ZigZagEncode(static_cast<int64_t>(null)));
+			node.value_byte = static_cast<uint8_t>(EncodingUtil::ZigZagEncode(static_cast<int64_t>(value)));
 		}
 	}
 	return node;
@@ -1033,7 +979,7 @@ idx_t AvroReader::CutBlocks(idx_t begin) const {
 		const char *limit = At(window.read_to);
 		int64_t count;
 		int64_t size;
-		if (!AvroReadLong(pos, count) || pos > limit || !AvroReadLong(pos, size) || pos > limit) {
+		if (!AvroReadBlockHeader(pos, limit, count, size)) {
 			return end;
 		}
 		if (count < 0 || size < 0) {
@@ -1095,8 +1041,7 @@ bool AvroReader::ParseBlock(idx_t start, int64_t &count, idx_t &data_start, idx_
 	const char *pos = begin;
 	const char *limit = At(available);
 	int64_t raw_size;
-	if (!AvroReadLong(pos, count) || pos > limit || !AvroReadLong(pos, raw_size) || pos > limit || count < 0 ||
-	    raw_size < 0) {
+	if (!AvroReadBlockHeader(pos, limit, count, raw_size) || count < 0 || raw_size < 0) {
 		return false;
 	}
 	data_start = start + static_cast<idx_t>(pos - begin);
@@ -1414,7 +1359,7 @@ bool AvroReader::LookupBlock(RowLookup &lookup, idx_t block, idx_t &records) {
 	const char *limit = begin + (lookup.End() - base);
 	int64_t count;
 	int64_t size;
-	if (!AvroReadLong(pos, count) || pos > limit || !AvroReadLong(pos, size) || pos > limit || count < 0 || size < 0) {
+	if (!AvroReadBlockHeader(pos, limit, count, size) || count < 0 || size < 0) {
 		return false;
 	}
 	const auto data_offset = static_cast<idx_t>(pos - begin);

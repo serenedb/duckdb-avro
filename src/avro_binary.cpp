@@ -1,5 +1,6 @@
 #include "avro_binary.hpp"
 
+#include "duckdb/common/bswap.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/numeric_utils.hpp"
@@ -18,20 +19,17 @@ public:
 
 	bool Long(int64_t &value) {
 		const auto available = static_cast<idx_t>(end - pos);
-		uint64_t result = 0;
-		for (idx_t i = 0; i < AVRO_MAX_VARINT_SIZE; i++) {
-			if (i >= available) {
+		uint64_t raw;
+		const auto size = EncodingUtil::TryDecodeUnsignedLEB128(const_data_ptr_cast(pos), available, raw);
+		if (size == 0) {
+			if (available < AVRO_MAX_VARINT_SIZE) {
 				return false;
 			}
-			const auto byte = static_cast<uint8_t>(pos[i]);
-			result |= static_cast<uint64_t>(byte & 0x7F) << (7 * i);
-			if (byte < 0x80) {
-				pos += i + 1;
-				value = AvroZigZagDecode(result);
-				return true;
-			}
+			throw InvalidInputException("Avro file header has an invalid number");
 		}
-		throw InvalidInputException("Avro file header has an invalid number");
+		pos += size;
+		value = EncodingUtil::ZigZagDecode(raw);
+		return true;
 	}
 
 	bool Bytes(string &out) {
@@ -67,16 +65,11 @@ void AppendBytes(string &out, const string &value) {
 }
 
 uint32_t LoadBigEndian(const char *data) {
-	auto bytes = reinterpret_cast<const uint8_t *>(data);
-	return (static_cast<uint32_t>(bytes[0]) << 24) | (static_cast<uint32_t>(bytes[1]) << 16) |
-	       (static_cast<uint32_t>(bytes[2]) << 8) | static_cast<uint32_t>(bytes[3]);
+	return BSwapIfLE(Load<uint32_t>(const_data_ptr_cast(data)));
 }
 
 void StoreBigEndian(uint32_t value, data_ptr_t out) {
-	out[0] = static_cast<uint8_t>(value >> 24);
-	out[1] = static_cast<uint8_t>(value >> 16);
-	out[2] = static_cast<uint8_t>(value >> 8);
-	out[3] = static_cast<uint8_t>(value);
+	Store<uint32_t>(BSwapIfLE(value), out);
 }
 
 [[noreturn]] void ThrowCorrupt(AvroCodec codec, const string &detail) {

@@ -10,6 +10,7 @@
 
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/serializer/encoding_util.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/formats/block_codecs.hpp"
 
@@ -20,7 +21,7 @@ namespace duckdb {
 static constexpr idx_t AVRO_SYNC_SIZE = 16;
 static constexpr idx_t AVRO_MAGIC_SIZE = 4;
 static constexpr char AVRO_MAGIC[AVRO_MAGIC_SIZE] = {'O', 'b', 'j', 1};
-static constexpr idx_t AVRO_MAX_VARINT_SIZE = 10;
+static constexpr idx_t AVRO_MAX_VARINT_SIZE = EncodingUtil::MaxLEB128Size<uint64_t>();
 static constexpr idx_t AVRO_PADDING = 64;
 
 enum class AvroCodec : uint8_t { NONE, DEFLATE, SNAPPY, ZSTANDARD };
@@ -28,53 +29,23 @@ enum class AvroCodec : uint8_t { NONE, DEFLATE, SNAPPY, ZSTANDARD };
 AvroCodec AvroCodecFromName(std::string_view name);
 std::string_view AvroCodecName(AvroCodec codec);
 
-inline bool AvroReadVarint(const char *&pos, uint64_t &value) {
-	auto bytes = reinterpret_cast<const uint8_t *>(pos);
-	uint64_t byte = bytes[0];
-	if (byte < 0x80) {
-		value = byte;
-		pos++;
-		return true;
-	}
-	uint64_t result = byte & 0x7F;
-	for (idx_t i = 1; i < AVRO_MAX_VARINT_SIZE; i++) {
-		byte = bytes[i];
-		result |= (byte & 0x7F) << (7 * i);
-		if (byte < 0x80) {
-			value = result;
-			pos += i + 1;
-			return true;
-		}
-	}
-	return false;
-}
-
-inline int64_t AvroZigZagDecode(uint64_t value) {
-	return static_cast<int64_t>((value >> 1) ^ (~(value & 1) + 1));
-}
-
-inline uint64_t AvroZigZagEncode(int64_t value) {
-	return (static_cast<uint64_t>(value) << 1) ^ static_cast<uint64_t>(value >> 63);
-}
-
 inline bool AvroReadLong(const char *&pos, int64_t &value) {
 	uint64_t raw;
-	if (!AvroReadVarint(pos, raw)) {
+	const auto size = EncodingUtil::TryDecodeUnsignedLEB128(const_data_ptr_cast(pos), AVRO_MAX_VARINT_SIZE, raw);
+	if (size == 0) {
 		return false;
 	}
-	value = AvroZigZagDecode(raw);
+	pos += size;
+	value = EncodingUtil::ZigZagDecode(raw);
 	return true;
 }
 
+inline bool AvroReadBlockHeader(const char *&pos, const char *limit, int64_t &count, int64_t &size) {
+	return AvroReadLong(pos, count) && pos <= limit && AvroReadLong(pos, size) && pos <= limit;
+}
+
 inline idx_t AvroWriteLong(int64_t value, data_ptr_t out) {
-	uint64_t raw = AvroZigZagEncode(value);
-	idx_t size = 0;
-	while (raw >= 0x80) {
-		out[size++] = static_cast<uint8_t>(raw | 0x80);
-		raw >>= 7;
-	}
-	out[size++] = static_cast<uint8_t>(raw);
-	return size;
+	return EncodingUtil::EncodeUnsignedLEB128(out, EncodingUtil::ZigZagEncode(value));
 }
 
 struct AvroMetadataEntry {
