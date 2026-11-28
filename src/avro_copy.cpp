@@ -4,12 +4,12 @@
 #include "field_ids.hpp"
 #include "read_avro.hpp"
 
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/bswap.hpp"
 #include "duckdb/common/enums/file_compression_type.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/json_document.hpp"
 #include "duckdb/common/random_engine.hpp"
-#include "duckdb/common/serializer/async_file_writer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -19,6 +19,7 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/formats/copy_file_writer.hpp"
 
 #include <algorithm>
 
@@ -1131,45 +1132,30 @@ private:
 	idx_t blocks_rows = 0;
 };
 
-unique_ptr<AsyncFileWriter> OpenAvroFileWriter(ClientContext &context, const string &file_path) {
-	auto &fs = FileSystem::GetFileSystem(context);
-	auto flags = FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW | FileCompressionType::AUTO_DETECT;
-	if (!fs.FileExists(file_path) && !fs.IsPipe(file_path)) {
-		flags |= FileFlags::FILE_FLAGS_EXCLUSIVE_CREATE;
-	}
-	return make_uniq<AsyncFileWriter>(QueryContext(context), fs, file_path, flags);
-}
-
 class WriteAvroGlobalState : public GlobalFunctionData {
 public:
 	WriteAvroGlobalState(ClientContext &context, const WriteAvroBindData &bind_data, const string &file_path)
-	    : file_writer(OpenAvroFileWriter(context, file_path)), compression(file_writer->GetFileCompressionType()) {
+	    : file(context, file_path, FileCompressionType::AUTO_DETECT, string()) {
 		RandomEngine engine;
 		engine.RandomData(data_ptr_cast(sync), AVRO_SYNC_SIZE);
 		string header;
 		AvroWriteHeader(bind_data.metadata, sync, header);
-		file_writer->WriteData(const_data_ptr_cast(header.data()), header.size());
+		file.WriteFrame(const_data_ptr_cast(header.data()), header.size());
 	}
 
 	void Write(const_data_ptr_t data, idx_t size, idx_t rows) {
-		lock_guard<mutex> guard(lock);
-		file_writer->WriteData(data, size);
+		file.WriteRows(data, size);
 		row_count += rows;
-		file_writer->ApplyBackpressure();
 	}
 
 	idx_t FileSize() {
-		lock_guard<mutex> guard(lock);
-		if (compression == FileCompressionType::UNCOMPRESSED) {
-			return file_writer->GetTotalWritten();
-		}
-		return file_writer->GetPhysicalFileSize();
+		return file.FileSize();
 	}
 
 	void Finalize() {
-		file_writer->Close();
+		const auto size = file.Close();
 		if (written_stats) {
-			written_stats->file_size_bytes = file_writer->GetTotalWritten();
+			written_stats->file_size_bytes = size;
 			written_stats->row_count = row_count;
 		}
 	}
@@ -1196,10 +1182,8 @@ public:
 	optional_ptr<CopyFunctionFileStatistics> written_stats;
 
 private:
-	unique_ptr<AsyncFileWriter> file_writer;
-	FileCompressionType compression;
-	mutex lock;
-	idx_t row_count = 0;
+	CopyFileWriter file;
+	atomic<idx_t> row_count {0};
 	mutex local_states_lock;
 	vector<unique_ptr<WriteAvroLocalState>> local_states;
 };
