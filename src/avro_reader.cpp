@@ -16,7 +16,6 @@
 #include "duckdb/execution/operator/csv_scanner/csv_reader_options.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include "duckdb/storage/table/column_segment.hpp"
 #include "simdutf.h"
 
 namespace duckdb {
@@ -883,7 +882,7 @@ AvroReader::AvroReader(AvroReaderGlobal &global_p)
     : global(global_p), header(global_p.source->header), window(*global_p.ranges),
       decompressor(BufferAllocator::Get(global_p.context)) {
 	for (auto &filter : global.columns.filters) {
-		filter_states.push_back(TableFilterState::Initialize(global.context, filter.filter.get()));
+		pushed_filters.Add(global.context, filter.filter.get(), filter.output_column);
 	}
 	filter_selection.Initialize(STANDARD_VECTOR_SIZE);
 	positions.resize(global.deferred * STANDARD_VECTOR_SIZE);
@@ -1237,13 +1236,8 @@ idx_t AvroReader::Fill(DataChunk &output) {
 }
 
 idx_t AvroReader::ApplyFilters(DataChunk &output, idx_t rows, bool lookup) {
-	auto &filters = global.columns.filters;
-	idx_t approved = rows;
 	filter_selection.Initialize(nullptr);
-	for (idx_t i = 0; i < filters.size() && approved > 0; i++) {
-		auto &vector = output.data[filters[i].output_column];
-		ColumnSegment::FilterSelection(filter_selection, vector, *filter_states[i], rows, approved);
-	}
+	const auto approved = pushed_filters.Apply(filter_selection, output, rows, rows);
 	if (approved == rows) {
 		return rows;
 	}

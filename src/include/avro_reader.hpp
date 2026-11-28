@@ -14,6 +14,7 @@
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
+#include "duckdb/formats/pushed_filters.hpp"
 #include "duckdb/formats/row_input.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
@@ -228,7 +229,7 @@ private:
 	const AvroHeader &header;
 	RowWindow window;
 	AvroDecompressor decompressor;
-	vector<unique_ptr<TableFilterState>> filter_states;
+	PushedFilters pushed_filters;
 	SelectionVector filter_selection;
 	idx_t range = 0;
 	idx_t range_end = 0;
