@@ -1,0 +1,63 @@
+# name: test/sql/reader/unions.test
+# description: read_avro drops null branches of unions, names the other members u<branch index> and keeps unions inside arrays and maps
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/unions.avro'))
+----
+id	INTEGER
+null_first	VARCHAR
+null_last	BIGINT
+null_two	UNION(u1 INTEGER, u2 VARCHAR)
+two	UNION(u0 VARCHAR, u1 BIGINT)
+null_middle	UNION(u0 INTEGER, u2 VARCHAR)
+single	INTEGER
+only_null	"NULL"
+records	UNION(u1 STRUCT(meow VARCHAR), u2 STRUCT(bark INTEGER))
+nullable_record	STRUCT(meow VARCHAR)
+in_array	UNION(u1 INTEGER, u2 VARCHAR)[]
+in_map	MAP(VARCHAR, UNION(u1 BIGINT, u2 VARCHAR))
+nullable_in_map	MAP(VARCHAR, INTEGER)
+collections	UNION(u1 INTEGER[], u2 MAP(VARCHAR, INTEGER))
+
+query IIIIIIIIIIIIII
+SELECT * FROM read_avro('test/reader/unions.avro') ORDER BY id
+----
+0	a	1	1	x	7	1	NULL	{'meow': purr}	{'meow': hiss}	[1, b, NULL]	{k=5, s=v, n=NULL}	{a=1, b=NULL}	[1, 2]
+1	NULL	NULL	s	42	NULL	-1	NULL	{'bark': 3}	NULL	[]	{}	{}	{x=1}
+2	(empty)	9223372036854775807	NULL	(empty)	z	2147483647	NULL	NULL	{'meow': ''}	[NULL, NULL]	{w=word}	{c=NULL}	NULL
+3	last	-9223372036854775808	-2147483648	-9223372036854775808	-2147483648	-2147483648	NULL	{'meow': a much longer string than twelve}	{'meow': z}	[x, 2147483647, y]	{big=9223372036854775807}	{d=-5}	[]
+
+query IIIIII
+SELECT id, union_tag(null_two), union_tag(two), union_tag(null_middle), union_tag(records), union_tag(collections) FROM read_avro('test/reader/unions.avro') ORDER BY id
+----
+0	u1	u0	u0	u1	u1
+1	u2	u1	NULL	u2	u2
+2	NULL	u0	u2	NULL	NULL
+3	u1	u1	u0	u1	u1
+
+query IIII
+SELECT id, union_tag(in_array[1]), union_tag(in_array[2]), union_tag(in_array[3]) FROM read_avro('test/reader/unions.avro') ORDER BY id
+----
+0	u1	u2	NULL
+1	NULL	NULL	NULL
+2	NULL	NULL	NULL
+3	u2	u1	u2
+
+query IIIII
+SELECT id, union_tag(in_map['k']), union_tag(in_map['s']), union_tag(in_map['w']), union_tag(in_map['big']) FROM read_avro('test/reader/unions.avro') ORDER BY id
+----
+0	u1	u2	NULL	NULL
+1	NULL	NULL	NULL	NULL
+2	NULL	NULL	u2	NULL
+3	NULL	NULL	NULL	u1
+
+query IIII
+SELECT id, union_extract(two, 'u1'), union_extract(records, 'u2').bark, union_extract(collections, 'u2')['x'] FROM read_avro('test/reader/unions.avro') ORDER BY id
+----
+0	NULL	NULL	NULL
+1	42	3	1
+2	NULL	NULL	NULL
+3	-9223372036854775808	NULL	NULL

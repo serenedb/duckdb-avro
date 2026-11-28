@@ -1,37 +1,39 @@
 #include "avro_copy.hpp"
 
+#include "avro_binary.hpp"
+#include "field_ids.hpp"
+#include "read_avro.hpp"
+
+#include "duckdb/common/atomic.hpp"
+#include "duckdb/common/bswap.hpp"
 #include "duckdb/common/enums/file_compression_type.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/json_document.hpp"
+#include "duckdb/common/random_engine.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/types.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
-#include "duckdb/common/vector/vector_iterator.hpp"
-#include "duckdb/function/function.hpp"
-#include "yyjson.hpp"
-#include "duckdb/common/printer.hpp"
-#include "field_ids.hpp"
-#include "duckdb/common/types/uuid.hpp"
-#include "errno.h"
+#include "duckdb/formats/copy_file_writer.hpp"
 
-using namespace duckdb_yyjson; // NOLINT
+#include <algorithm>
 
 namespace duckdb {
 
 namespace {
 
-struct YyjsonDocDeleter {
-	void operator()(yyjson_doc *doc) {
-		yyjson_doc_free(doc);
-	}
-	void operator()(yyjson_mut_doc *doc) {
-		yyjson_mut_doc_free(doc);
-	}
-};
+constexpr idx_t AVRO_BLOCK_SIZE = 256 * 1024;
+constexpr idx_t AVRO_UUID_SIZE = 16;
+constexpr uint8_t AVRO_NULL_BRANCH = 0;
+constexpr uint8_t AVRO_VALUE_BRANCH = 2;
+constexpr uint8_t AVRO_ARRAY_END = 0;
 
-} // namespace
-
-static string ConvertTypeToAvro(const LogicalType &type) {
+string ConvertTypeToAvro(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::VARCHAR:
 		return "string";
@@ -53,120 +55,194 @@ static string ConvertTypeToAvro(const LogicalType &type) {
 		return "record";
 	case LogicalTypeId::DATE:
 		return "int";
-	case LogicalTypeId::TIME: {
-		return "long";
-	}
+	case LogicalTypeId::TIME:
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_MS: {
-		// captures
-		// timestamp-micros
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_TZ:
 		return "long";
-	}
-	case LogicalTypeId::TIMESTAMP_TZ: {
-		// timestamp tz will capture
-		// local-timestamp-micros
-		return "long";
-	}
 	case LogicalTypeId::UUID:
-	case LogicalTypeId::DECIMAL: {
+	case LogicalTypeId::DECIMAL:
 		return "fixed";
-	}
-	case LogicalTypeId::ENUM:
-		//! FIXME: this should be implemented at some point
-		throw NotImplementedException("Can't convert logical type '%s' to Avro type", type.ToString());
 	case LogicalTypeId::LIST:
-		return "array";
 	case LogicalTypeId::MAP:
-		//! This uses a 'logicalType': map, and a struct as 'items'
 		return "array";
 	default:
 		throw NotImplementedException("Can't convert logical type '%s' to Avro type", type.ToString());
-	};
-
-	//! FIXME: we don't have support for 'FIXED' currently (a fixed size blob)
+	}
 }
 
-static string GetTemporalLogicalType(const LogicalType &type) {
+string GetTemporalLogicalType(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::DATE:
 		return "date";
-	case LogicalTypeId::TIME: {
+	case LogicalTypeId::TIME:
 		return "time-micros";
-	}
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_TZ: {
+	case LogicalTypeId::TIMESTAMP_TZ:
 		return "timestamp-micros";
-	}
-	case LogicalTypeId::TIMESTAMP_NS: {
+	case LogicalTypeId::TIMESTAMP_NS:
 		return "timestamp-nanos";
-	}
 	default:
 		throw NotImplementedException("Can't convert logical type '%s' to Avro temporal type", type.ToString());
 	}
 }
 
 uint32_t MinBytesRequiredForDecimal(int32_t precision) {
-	// Number of bits needed: ceil(precision * log2(10)) + 1 (sign bit)
-	// log2(10) ~ 10/3, but more precisely we use the fact that
-	// 10^P requires ceil(P * log2(10)) bits.
-	// Exact bit counts per precision bracket:
-	static constexpr int32_t BITS_REQUIRED[] = {
-	    0,   // precision 0 (unused)
-	    4,   // 1  -> max 9
-	    7,   // 2  -> max 99
-	    10,  // 3  -> max 999
-	    14,  // 4  -> max 9999
-	    17,  // 5
-	    20,  // 6
-	    24,  // 7
-	    27,  // 8
-	    30,  // 9
-	    34,  // 10
-	    37,  // 11
-	    40,  // 12
-	    44,  // 13
-	    47,  // 14
-	    50,  // 15
-	    54,  // 16
-	    57,  // 17
-	    60,  // 18
-	    64,  // 19
-	    67,  // 20
-	    70,  // 21
-	    74,  // 22
-	    77,  // 23
-	    80,  // 24
-	    84,  // 25
-	    87,  // 26
-	    90,  // 27
-	    94,  // 28
-	    97,  // 29
-	    100, // 30
-	    103, // 31
-	    107, // 32
-	    110, // 33
-	    113, // 34
-	    117, // 35
-	    120, // 36
-	    123, // 37
-	    127, // 38
-	};
-	auto ret = (BITS_REQUIRED[precision] + 7) / 8; // ceil(bits / 8)
-	return ret;
+	static constexpr int32_t BITS_REQUIRED[] = {0,  4,  7,  10, 14,  17,  20,  24,  27,  30,  34,  37,  40,
+	                                            44, 47, 50, 54, 57,  60,  64,  67,  70,  74,  77,  80,  84,
+	                                            87, 90, 94, 97, 100, 103, 107, 110, 113, 117, 120, 123, 127};
+	return (BITS_REQUIRED[precision] + 1 + 7) / 8;
 }
 
-static bool IsNamedSchema(const LogicalType &type) {
+bool IsNamedSchema(const LogicalType &type) {
 	switch (type.id()) {
-	//! NOTE: 'fixed' is also part of this, but we don't have that type in DuckDB
 	case LogicalTypeId::STRUCT:
-	case LogicalTypeId::ENUM:
 	case LogicalTypeId::UUID:
 	case LogicalTypeId::DECIMAL:
 		return true;
 	default:
 		return false;
+	}
+}
+
+bool IsAvroIdentifier(const string &name) {
+	if (name.empty()) {
+		return false;
+	}
+	for (idx_t i = 0; i < name.size(); i++) {
+		const auto c = name[i];
+		if (!(StringUtil::CharacterIsAlpha(c) || c == '_' || (i && StringUtil::CharacterIsDigit(c)))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+struct AvroWriteSchema {
+	LogicalType type;
+	bool nullable = false;
+	string field;
+	string name;
+	bool has_field_id = false;
+	int32_t field_id = 0;
+	idx_t entry = 0;
+	vector<AvroWriteSchema> children;
+};
+
+void WriteAvroValueType(JSONStringWriter &writer, const AvroWriteSchema &schema);
+
+void WriteAvroType(JSONStringWriter &writer, const AvroWriteSchema &schema) {
+	if (!schema.nullable) {
+		WriteAvroValueType(writer, schema);
+		return;
+	}
+	writer.StartArray();
+	writer.String("null");
+	WriteAvroValueType(writer, schema);
+	writer.EndArray();
+}
+
+void WriteAvroField(JSONStringWriter &writer, const AvroWriteSchema &field) {
+	writer.StartObject();
+	writer.Key("name");
+	writer.String(field.field);
+	writer.Key("type");
+	WriteAvroType(writer, field);
+	if (field.has_field_id) {
+		writer.Key("field-id");
+		writer.SignedInteger(field.field_id);
+	}
+	writer.EndObject();
+}
+
+void WriteAvroValueType(JSONStringWriter &writer, const AvroWriteSchema &schema) {
+	auto &type = schema.type;
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT:
+		writer.StartObject();
+		writer.Key("type");
+		writer.String("record");
+		writer.Key("name");
+		writer.String(schema.name);
+		writer.Key("fields");
+		writer.StartArray();
+		for (auto &field : schema.children) {
+			WriteAvroField(writer, field);
+		}
+		writer.EndArray();
+		writer.EndObject();
+		break;
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::MAP: {
+		auto &items = schema.children[0];
+		writer.StartObject();
+		writer.Key("type");
+		writer.String("array");
+		if (items.has_field_id) {
+			writer.Key("element-id");
+			writer.SignedInteger(items.field_id);
+		}
+		if (type.id() == LogicalTypeId::MAP) {
+			writer.Key("logicalType");
+			writer.String("map");
+		}
+		writer.Key("items");
+		WriteAvroType(writer, items);
+		writer.EndObject();
+		break;
+	}
+	case LogicalTypeId::DECIMAL: {
+		const auto width = DecimalType::GetWidth(type);
+		writer.StartObject();
+		writer.Key("type");
+		writer.String("fixed");
+		writer.Key("name");
+		writer.String(schema.name);
+		writer.Key("size");
+		writer.UnsignedInteger(MinBytesRequiredForDecimal(width));
+		writer.Key("logicalType");
+		writer.String("decimal");
+		writer.Key("precision");
+		writer.UnsignedInteger(width);
+		writer.Key("scale");
+		writer.UnsignedInteger(DecimalType::GetScale(type));
+		writer.EndObject();
+		break;
+	}
+	case LogicalTypeId::UUID:
+		writer.StartObject();
+		writer.Key("type");
+		writer.String("fixed");
+		writer.Key("name");
+		writer.String(schema.name);
+		writer.Key("size");
+		writer.UnsignedInteger(AVRO_UUID_SIZE);
+		writer.Key("logicalType");
+		writer.String("uuid");
+		writer.EndObject();
+		break;
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+		writer.StartObject();
+		writer.Key("type");
+		writer.String(ConvertTypeToAvro(type));
+		writer.Key("logicalType");
+		writer.String(GetTemporalLogicalType(type));
+		if (type.id() == LogicalTypeId::TIMESTAMP_TZ) {
+			writer.Key("adjust-to-utc");
+			writer.Boolean(true);
+		}
+		writer.EndObject();
+		break;
+	default:
+		writer.String(ConvertTypeToAvro(type));
+		break;
 	}
 }
 
@@ -179,14 +255,6 @@ private:
 
 public:
 	JSONSchemaGenerator(const vector<string> &names, const vector<LogicalType> &types) : names(names), types(types) {
-		doc = yyjson_mut_doc_new(nullptr);
-		root_object = yyjson_mut_obj(doc);
-		yyjson_mut_doc_set_root(doc, root_object);
-	}
-	~JSONSchemaGenerator() {
-		if (doc) {
-			yyjson_mut_doc_free(doc);
-		}
 	}
 
 public:
@@ -201,6 +269,7 @@ public:
 		field_ids = avro::FieldIDUtils::ParseFieldIds(it->second[0], names, types);
 		recognized.insert(it->first);
 	}
+
 	void ParseRootName(const identifier_map_t<vector<Value>> &options, identifier_set_t &recognized) {
 		auto it = options.find("ROOT_NAME");
 		if (it == options.end()) {
@@ -230,15 +299,42 @@ public:
 		recognized.insert(it->first);
 	}
 
-public:
-	void VerifyAvroName(const string &name) {
-		D_ASSERT(!name.empty());
-		for (idx_t i = 0; i < name.size(); i++) {
-			if (!(isalpha(name[i]) || name[i] == '_' || (i && isdigit(name[i])))) {
-				throw InvalidInputException("'%s' is not a valid Avro identifier\nThe identifier has to match the "
-				                            "regex: [A-Za-z_][A-Za-z0-9_]*",
-				                            name);
+	AvroWriteSchema Generate() {
+		VerifyAvroName(root_name);
+		VerifyNamedSchemaUniqueness(root_name);
+		D_ASSERT(names.size() == types.size());
+		AvroWriteSchema root;
+		root.type = LogicalType(LogicalTypeId::STRUCT);
+		root.name = root_name;
+		unordered_map<string, string> field_names;
+		for (idx_t i = 0; i < names.size(); i++) {
+			optional_ptr<avro::FieldID> field_id;
+			auto &children = field_ids.Ids();
+			auto it = children.find(names[i]);
+			if (it != children.end()) {
+				field_id = it->second;
 			}
+			root.children.push_back(CreateStructField(names[i], types[i], field_id, field_names));
+			root.children.back().entry = i;
+		}
+		return root;
+	}
+
+private:
+	void VerifyAvroName(const string &name) {
+		if (!IsAvroIdentifier(name)) {
+			throw InvalidInputException("'%s' is not a valid Avro identifier\nThe identifier has to match the "
+			                            "regex: [A-Za-z_][A-Za-z0-9_]*",
+			                            name);
+		}
+	}
+
+	void VerifyNamedSchemaUniqueness(const string &name) {
+		auto res = named_schemas.insert(name);
+		if (!res.second) {
+			throw BinderException("Avro schema by the name of '%s' already exists, names of 'record', 'enum' and "
+			                      "'fixed' types have to be distinct",
+			                      name);
 		}
 	}
 
@@ -249,163 +345,6 @@ public:
 		return res;
 	}
 
-	bool IsJSONObject(yyjson_mut_val *val) {
-		auto type = yyjson_mut_get_type(val);
-		return type == YYJSON_TYPE_OBJ;
-	}
-
-	yyjson_mut_val *WrapTypeInObject(yyjson_mut_doc *doc, yyjson_mut_val *type_val) {
-		if (IsJSONObject(type_val)) {
-			return type_val;
-		}
-		auto object = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, object, "type", type_val);
-		return object;
-	}
-
-	yyjson_mut_val *CreateJSONType(const LogicalType &type, optional_ptr<avro::FieldID> field_id,
-	                               const char *preset_schema_name = nullptr) {
-		auto avro_type_str = ConvertTypeToAvro(type);
-		auto type_val = yyjson_mut_strcpy(doc, avro_type_str.c_str());
-		auto type_id = type.id();
-
-		if (type_id == LogicalTypeId::STRUCT) {
-			type_val = WrapTypeInObject(doc, type_val);
-			auto &struct_children = StructType::GetChildTypes(type);
-			auto fields = yyjson_mut_obj_add_arr(doc, type_val, "fields");
-			unordered_map<string, string> field_names;
-			for (auto &it : struct_children) {
-				auto &child_name = it.first;
-				if (child_name == "__duckdb_empty_struct_marker") {
-					continue;
-				}
-				auto &child_type = it.second;
-				auto child_field_id = GetChildFieldIdByName(field_id, child_name.GetIdentifierName());
-
-				auto struct_field =
-				    CreateStructField(child_name.GetIdentifierName(), child_type, child_field_id, field_names);
-				yyjson_mut_arr_add_val(fields, struct_field);
-			}
-		} else if (type_id == LogicalTypeId::LIST) {
-			type_val = WrapTypeInObject(doc, type_val);
-
-			auto &list_child = ListType::GetChildType(type);
-			auto element_field_id = GetChildFieldIdByName(field_id, "list");
-			yyjson_mut_val *items_type_val;
-			if (list_child.id() == LogicalTypeId::STRUCT && element_field_id) {
-				auto preset_schema_name = StringUtil::Format("r%d", element_field_id->GetFieldId());
-				items_type_val = CreateJSONType(list_child, element_field_id, preset_schema_name.c_str());
-			} else {
-				items_type_val = CreateJSONType(list_child, element_field_id);
-			}
-
-			if (!element_field_id || element_field_id->nullable) {
-				auto union_array = yyjson_mut_arr(doc);
-				yyjson_mut_arr_add_strcpy(doc, union_array, "null");
-				yyjson_mut_arr_add_val(union_array, items_type_val);
-				items_type_val = union_array;
-			}
-			yyjson_mut_obj_add_val(doc, type_val, "items", items_type_val);
-
-			if (element_field_id) {
-				yyjson_mut_obj_add_int(doc, type_val, "element-id", element_field_id->GetFieldId());
-			}
-		} else if (type_id == LogicalTypeId::MAP) {
-			type_val = WrapTypeInObject(doc, type_val);
-
-			yyjson_mut_obj_add_strcpy(doc, type_val, "logicalType", "map");
-
-			yyjson_mut_val *map_items_val;
-			MapKeyValueIds key_value_ids;
-			auto &list_child = ListType::GetChildType(type);
-			D_ASSERT(list_child.id() == LogicalTypeId::STRUCT);
-
-			if (!GetMapKeyValueIds(field_id, key_value_ids)) {
-				map_items_val = CreateJSONType(list_child, field_id);
-			} else {
-				auto preset_schema_name = StringUtil::Format("k%d_v%d", key_value_ids.key_id, key_value_ids.value_id);
-				map_items_val = CreateJSONType(list_child, field_id, preset_schema_name.c_str());
-			}
-			yyjson_mut_obj_add_val(doc, type_val, "items", map_items_val);
-		} else if (type.IsTemporal()) {
-			type_val = WrapTypeInObject(doc, type_val);
-			yyjson_mut_obj_add_strcpy(doc, type_val, "logicalType", GetTemporalLogicalType(type).c_str());
-			if (type == LogicalTypeId::TIMESTAMP_TZ) {
-				yyjson_mut_obj_add_bool(doc, type_val, "adjust-to-utc", true);
-			}
-		} else if (type_id == LogicalTypeId::DECIMAL) {
-			type_val = WrapTypeInObject(doc, type_val);
-			auto scale = DecimalType::GetScale(type);
-			auto width = DecimalType::GetWidth(type);
-			yyjson_mut_obj_add_strcpy(doc, type_val, "logicalType", "decimal");
-			yyjson_mut_obj_add_uint(doc, type_val, "scale", scale);
-			yyjson_mut_obj_add_uint(doc, type_val, "precision", width);
-			yyjson_mut_obj_add_uint(doc, type_val, "size", MinBytesRequiredForDecimal(width));
-		} else if (type_id == LogicalTypeId::UUID) {
-			type_val = WrapTypeInObject(doc, type_val);
-			yyjson_mut_obj_add_strcpy(doc, type_val, "logicalType", "uuid");
-			yyjson_mut_obj_add_uint(doc, type_val, "size", 16);
-		} else if (type.IsNested()) {
-			throw NotImplementedException("Can't convert nested type '%s' to Avro", type.ToString());
-		}
-
-		if (IsNamedSchema(type)) {
-			D_ASSERT(IsJSONObject(type_val));
-			if (preset_schema_name) {
-				VerifyAvroName(preset_schema_name);
-				VerifyNamedSchemaUniqueness(preset_schema_name);
-				yyjson_mut_obj_add_strcpy(doc, type_val, "name", preset_schema_name);
-			} else {
-				auto named_schema = GenerateSchemaName(avro_type_str);
-				yyjson_mut_obj_add_strcpy(doc, type_val, "name", named_schema.c_str());
-			}
-		}
-		return type_val;
-	}
-
-	string GenerateJSON() {
-		VerifyAvroName(root_name);
-		VerifyNamedSchemaUniqueness(root_name);
-		yyjson_mut_obj_add_str(doc, root_object, "type", "record");
-		yyjson_mut_obj_add_strcpy(doc, root_object, "name", root_name.c_str());
-		auto array = yyjson_mut_obj_add_arr(doc, root_object, "fields");
-
-		unordered_map<string, string> field_names;
-		//! Add all the fields
-		D_ASSERT(names.size() == types.size());
-		for (idx_t i = 0; i < names.size(); i++) {
-			auto &name = names[i];
-			auto &type = types[i];
-			optional_ptr<avro::FieldID> field_id;
-			auto &children = field_ids.Ids();
-			auto it = children.find(name);
-			if (it != children.end()) {
-				field_id = it->second;
-			}
-			yyjson_mut_arr_add_val(array, CreateStructField(name, type, field_id, field_names));
-		}
-
-		//! Write the result to a string
-		auto data = yyjson_mut_val_write_opts(root_object, YYJSON_WRITE_ALLOW_INF_AND_NAN, nullptr, nullptr, nullptr);
-		if (!data) {
-			yyjson_mut_doc_free(doc);
-			throw InvalidInputException("Could not create a JSON representation of the table schema, yyjson failed");
-		}
-		auto res = string(data);
-		free(data);
-		return res;
-	}
-
-private:
-	void VerifyNamedSchemaUniqueness(const string &name) {
-		auto res = named_schemas.insert(name);
-		if (!res.second) {
-			throw BinderException("Avro schema by the name of '%s' already exists, names of 'record', 'enum' and "
-			                      "'fixed' types have to be distinct",
-			                      name);
-		}
-	}
-
 	string SanitizeFieldName(const string &name, unordered_map<string, string> &field_names) {
 		if (!sanitize_field_names) {
 			return name;
@@ -413,8 +352,6 @@ private:
 		if (name.empty()) {
 			throw InvalidInputException("Cannot sanitize an empty Avro field name");
 		}
-		// Follow Iceberg's AvroSchemaUtil escaping for ASCII. Escape UTF-8 bytes as well,
-		// since the Avro identifier grammar only permits ASCII letters and digits.
 		string result;
 		result.reserve(name.size());
 		for (idx_t i = 0; i < name.size(); i++) {
@@ -437,27 +374,91 @@ private:
 		return result;
 	}
 
-	yyjson_mut_val *CreateStructField(const string &name, const LogicalType &type, optional_ptr<avro::FieldID> field_id,
+	static bool HasId(optional_ptr<avro::FieldID> field_id) {
+		return field_id && field_id->set;
+	}
+
+	static void ApplyFieldId(AvroWriteSchema &schema, optional_ptr<avro::FieldID> field_id) {
+		schema.nullable = schema.type.id() != LogicalTypeId::SQLNULL && (!field_id || field_id->nullable);
+		if (HasId(field_id)) {
+			schema.has_field_id = true;
+			schema.field_id = field_id->GetFieldId();
+		}
+	}
+
+	AvroWriteSchema CreateStructField(const string &name, const LogicalType &type, optional_ptr<avro::FieldID> field_id,
 	                                  unordered_map<string, string> &field_names) {
 		auto output_name = SanitizeFieldName(name, field_names);
-		auto struct_field = yyjson_mut_obj(doc);
 		auto schema_name = output_name;
-		if (type.id() == LogicalTypeId::STRUCT && field_id) {
+		if (type.id() == LogicalTypeId::STRUCT && HasId(field_id)) {
 			schema_name = StringUtil::Format("r%d", field_id->GetFieldId());
 		}
-		auto struct_field_type = CreateJSONType(type, field_id, schema_name.c_str());
-		if (!field_id || field_id->nullable) {
-			auto union_array = yyjson_mut_arr(doc);
-			yyjson_mut_arr_add_strcpy(doc, union_array, "null");
-			yyjson_mut_arr_add_val(union_array, struct_field_type);
-			struct_field_type = union_array;
+		auto result = CreateSchemaType(type, field_id, schema_name.c_str());
+		ApplyFieldId(result, field_id);
+		result.field = std::move(output_name);
+		return result;
+	}
+
+	AvroWriteSchema CreateSchemaType(const LogicalType &type, optional_ptr<avro::FieldID> field_id,
+	                                 const char *preset_schema_name = nullptr) {
+		auto avro_type_str = ConvertTypeToAvro(type);
+		AvroWriteSchema result;
+		result.type = type;
+		switch (type.id()) {
+		case LogicalTypeId::STRUCT: {
+			auto &struct_children = StructType::GetChildTypes(type);
+			unordered_map<string, string> field_names;
+			for (idx_t i = 0; i < struct_children.size(); i++) {
+				auto &child = struct_children[i];
+				if (child.first == "__duckdb_empty_struct_marker") {
+					continue;
+				}
+				auto &child_name = child.first.GetIdentifierName();
+				auto child_field_id = GetChildFieldIdByName(field_id, child_name);
+				result.children.push_back(CreateStructField(child_name, child.second, child_field_id, field_names));
+				result.children.back().entry = i;
+			}
+			break;
 		}
-		yyjson_mut_obj_add_val(doc, struct_field, "type", struct_field_type);
-		if (field_id) {
-			yyjson_mut_obj_add_uint(doc, struct_field, "field-id", field_id->GetFieldId());
+		case LogicalTypeId::LIST: {
+			auto &list_child = ListType::GetChildType(type);
+			auto element_field_id = GetChildFieldIdByName(field_id, "list");
+			AvroWriteSchema items;
+			if (list_child.id() == LogicalTypeId::STRUCT && HasId(element_field_id)) {
+				auto preset = StringUtil::Format("r%d", element_field_id->GetFieldId());
+				items = CreateSchemaType(list_child, element_field_id, preset.c_str());
+			} else {
+				items = CreateSchemaType(list_child, element_field_id);
+			}
+			ApplyFieldId(items, element_field_id);
+			result.children.push_back(std::move(items));
+			break;
 		}
-		yyjson_mut_obj_add_strcpy(doc, struct_field, "name", output_name.c_str());
-		return struct_field;
+		case LogicalTypeId::MAP: {
+			auto &list_child = ListType::GetChildType(type);
+			D_ASSERT(list_child.id() == LogicalTypeId::STRUCT);
+			MapKeyValueIds key_value_ids;
+			if (GetMapKeyValueIds(field_id, key_value_ids)) {
+				auto preset = StringUtil::Format("k%d_v%d", key_value_ids.key_id, key_value_ids.value_id);
+				result.children.push_back(CreateSchemaType(list_child, field_id, preset.c_str()));
+			} else {
+				result.children.push_back(CreateSchemaType(list_child, field_id));
+			}
+			break;
+		}
+		default:
+			break;
+		}
+		if (IsNamedSchema(type)) {
+			if (preset_schema_name) {
+				VerifyAvroName(preset_schema_name);
+				VerifyNamedSchemaUniqueness(preset_schema_name);
+				result.name = preset_schema_name;
+			} else {
+				result.name = GenerateSchemaName(avro_type_str);
+			}
+		}
+		return result;
 	}
 
 	optional_ptr<avro::FieldID> GetChildFieldIdByName(optional_ptr<avro::FieldID> parent, const string &name) {
@@ -476,10 +477,9 @@ private:
 		if (!field_id) {
 			return false;
 		}
-
 		auto key = GetChildFieldIdByName(field_id, "key");
 		auto value = GetChildFieldIdByName(field_id, "value");
-		if (key && value) {
+		if (HasId(key) && HasId(value)) {
 			ids.key_id = key->GetFieldId();
 			ids.value_id = value->GetFieldId();
 			return true;
@@ -487,7 +487,7 @@ private:
 		return false;
 	}
 
-public:
+private:
 	const vector<string> &names;
 	const vector<LogicalType> &types;
 
@@ -495,27 +495,36 @@ public:
 	string root_name = "root";
 	avro::ChildFieldIDs field_ids;
 	idx_t generated_name_id = 0;
-	yyjson_mut_doc *doc = nullptr;
-	yyjson_mut_val *root_object;
 	unordered_set<string> named_schemas;
 };
 
-static string CreateJSONSchema(const identifier_map_t<vector<Value>> &options, const vector<string> &names,
-                               const vector<LogicalType> &types, identifier_set_t &recognized) {
-	JSONSchemaGenerator state(names, types);
-
-	state.ParseFieldIds(options, recognized);
-	state.ParseRootName(options, recognized);
-	state.ParseSanitizeFieldNames(options, recognized);
-	return state.GenerateJSON();
+string CreateJSONSchema(const AvroWriteSchema &root) {
+	try {
+		JSONStringWriter writer(JSONWriteFlags::ALLOW_INF_AND_NAN);
+		WriteAvroValueType(writer, root);
+		return writer.ToString();
+	} catch (SerializationException &) {
+		throw InvalidInputException("Could not create a JSON representation of the table schema");
+	}
 }
 
-static string CreateJSONMetadata(const identifier_map_t<vector<Value>> &options, identifier_set_t &recognized) {
+void VerifyFieldNames(const AvroWriteSchema &schema) {
+	for (auto &child : schema.children) {
+		if (schema.type.id() == LogicalTypeId::STRUCT && !IsAvroIdentifier(child.field)) {
+			throw InvalidInputException("Invalid Avro identifier \"%s\": field names have to match the regex "
+			                            "[A-Za-z_][A-Za-z0-9_]*, or set SANITIZE_FIELD_NAMES",
+			                            child.field);
+		}
+		VerifyFieldNames(child);
+	}
+}
+
+vector<AvroMetadataEntry> ParseMetadata(const identifier_map_t<vector<Value>> &options, identifier_set_t &recognized) {
+	vector<AvroMetadataEntry> result;
 	auto it = options.find("METADATA");
 	if (it == options.end()) {
-		return "";
+		return result;
 	}
-
 	if (it->second.empty()) {
 		throw InvalidInputException("METADATA can not be provided without a value");
 	}
@@ -524,43 +533,15 @@ static string CreateJSONMetadata(const identifier_map_t<vector<Value>> &options,
 		throw InvalidInputException("'METADATA' is expected to be provided as a STRUCT of key-value string metadata");
 	}
 	recognized.insert(it->first);
-
-	unordered_map<string, string> metadata;
 	auto &children = StructValue::GetChildren(value);
 	auto &child_types = StructType::GetChildTypes(value.type());
 	for (idx_t i = 0; i < children.size(); i++) {
-		auto &child = children[i];
-		auto &child_name = child_types[i].first;
-		metadata[child_name.GetIdentifierName()] = child.ToString();
+		result.push_back(AvroMetadataEntry {child_types[i].first.GetIdentifierName(), children[i].ToString()});
 	}
-
-	std::unique_ptr<yyjson_mut_doc, YyjsonDocDeleter> doc_p(yyjson_mut_doc_new(nullptr));
-	auto doc = doc_p.get();
-	yyjson_mut_val *root_object = yyjson_mut_obj(doc);
-	yyjson_mut_doc_set_root(doc, root_object);
-
-	for (auto &item : metadata) {
-		auto &key = item.first;
-		auto &value = item.second;
-		yyjson_mut_obj_add_strcpy(doc, root_object, key.c_str(), value.c_str());
-	}
-
-	//! Write the result to a string
-	auto data = yyjson_mut_val_write_opts(root_object, YYJSON_WRITE_ALLOW_INF_AND_NAN, nullptr, nullptr, nullptr);
-	if (!data) {
-		throw InvalidInputException("Could not create a JSON representation of the metadata, yyjson failed");
-	}
-	auto res = string(data);
-	free(data);
-	return res;
+	return result;
 }
 
-//! Parse the CODEC option (Avro object-container compression codec). Validates the value is a
-//! non-empty VARCHAR and returns the lowercased codec name; empty string when unset (writer
-//! defaults to "null"). The codec name itself is validated by avro-c when the writer is created
-//! (it reports "Unknown codec X" for anything the library was not built with), so this stays in
-//! lock-step with avro-c's actual capabilities instead of duplicating a list that could drift.
-static string ParseCodec(const identifier_map_t<vector<Value>> &options, identifier_set_t &recognized) {
+string ParseCodec(const identifier_map_t<vector<Value>> &options, identifier_set_t &recognized) {
 	auto it = options.find("CODEC");
 	if (it == options.end()) {
 		return "";
@@ -576,18 +557,9 @@ static string ParseCodec(const identifier_map_t<vector<Value>> &options, identif
 	return StringUtil::Lower(value.GetValue<string>());
 }
 
-WriteAvroBindData::WriteAvroBindData(CopyFunctionBindInput &input, const vector<Identifier> &names,
-                                     const vector<LogicalType> &types)
-    : names(IdentifiersToStrings(names)), types(types) {
-
-	identifier_set_t recognized;
-
-	json_metadata = CreateJSONMetadata(input.info.options, recognized);
-	json_schema = CreateJSONSchema(input.info.options, this->names, types, recognized);
-	codec = ParseCodec(input.info.options, recognized);
-
+void VerifyRecognizedOptions(const identifier_map_t<vector<Value>> &options, const identifier_set_t &recognized) {
 	vector<string> unrecognized_options;
-	for (auto &option : input.info.options) {
+	for (auto &option : options) {
 		if (recognized.count(option.first)) {
 			continue;
 		}
@@ -603,540 +575,755 @@ WriteAvroBindData::WriteAvroBindData(CopyFunctionBindInput &input, const vector<
 		throw InvalidConfigurationException("The following option(s) are not recognized: %s",
 		                                    StringUtil::Join(unrecognized_options, ", "));
 	}
-	if (avro_schema_from_json_length(json_schema.c_str(), json_schema.size(), &schema)) {
-		throw InvalidInputException(avro_strerror());
-	}
-	interface = avro_generic_class_from_schema(schema);
-	if (!interface) {
-		avro_schema_decref(schema);
-		throw InvalidInputException(avro_strerror());
-	}
 }
 
-WriteAvroBindData::~WriteAvroBindData() {
-	avro_schema_decref(schema);
-	avro_value_iface_decref(interface);
-}
-
-WriteAvroGlobalState::WriteAvroGlobalState(ClientContext &context, FunctionData &bind_data_p, FileSystem &fs,
-                                           const string &file_path)
-    : allocator(Allocator::Get(context)), memory_buffer(allocator), datum_buffer(allocator), fs(fs) {
-	handle = fs.OpenFile(file_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW |
-	                                    FileLockType::WRITE_LOCK | FileCompressionType::AUTO_DETECT);
-	auto &bind_data = bind_data_p.Cast<WriteAvroBindData>();
-
-	//! Guess how big the "header" of the Avro file needs to be
-	idx_t capacity =
-	    MaxValue<idx_t>(BUFFER_SIZE, NextPowerOfTwo(bind_data.json_schema.size() + SYNC_SIZE + MAX_ROW_COUNT_BYTES));
-	memory_buffer.Resize(capacity);
-
-	int ret;
-	writer = avro_writer_memory(const_char_ptr_cast(memory_buffer.GetData()), memory_buffer.GetCapacity());
-	datum_writer = avro_writer_memory(const_char_ptr_cast(datum_buffer.GetData()), datum_buffer.GetCapacity());
-
-	const char *json_metadata = nullptr;
-	if (!bind_data.json_metadata.empty()) {
-		json_metadata = bind_data.json_metadata.c_str();
-	}
-
-	//! Pass the compression codec straight to avro-c so the object container is written compressed
-	//! natively (no post-processing). Empty -> nullptr -> avro-c default ("null"/uncompressed).
-	const char *codec = bind_data.codec.empty() ? nullptr : bind_data.codec.c_str();
-
-	avro_file_writer_t created = nullptr;
-	while ((ret = avro_file_writer_create_from_writers_with_metadata_and_codec(
-	            writer, datum_writer, bind_data.schema, &created, json_metadata, codec)) == ENOSPC) {
-		avro_file_writer_close(created);
-		created = nullptr;
-		memory_buffer.Resize(NextPowerOfTwo(memory_buffer.GetCapacity() * 2));
-		// re-initialize writer to use correct data location
-		writer = avro_writer_memory(const_char_ptr_cast(memory_buffer.GetData()), memory_buffer.GetCapacity());
-		datum_writer = avro_writer_memory(const_char_ptr_cast(datum_buffer.GetData()), datum_buffer.GetCapacity());
-	}
-	file_writer.reset(created);
-	if (ret) {
-		const string error = avro_strerror();
-		if (!file_writer) {
-			avro_writer_free(writer);
-			avro_writer_free(datum_writer);
-		}
-		throw InvalidInputException(error);
-	}
-
-	auto written_bytes = avro_writer_tell(writer);
-	WriteData(memory_buffer.GetData(), written_bytes);
-	avro_writer_memory_set_dest(writer, (const char *)memory_buffer.GetData(), memory_buffer.GetCapacity());
-}
-
-static unique_ptr<FunctionData> WriteAvroBind(ClientContext &context, CopyFunctionBindInput &input,
-                                              const vector<Identifier> &names, const vector<LogicalType> &sql_types) {
-	auto res = make_uniq<WriteAvroBindData>(input, names, sql_types);
-	return std::move(res);
-}
-
-static unique_ptr<LocalFunctionData> WriteAvroInitializeLocal(ExecutionContext &context, FunctionData &bind_data_p) {
-	auto res = make_uniq<WriteAvroLocalState>(bind_data_p);
-	return std::move(res);
-}
-
-static unique_ptr<GlobalFunctionData> WriteAvroInitializeGlobal(ClientContext &context, FunctionData &bind_data_p,
-                                                                const string &file_path) {
-	auto res = make_uniq<WriteAvroGlobalState>(context, bind_data_p, FileSystem::GetFileSystem(context), file_path);
-	return std::move(res);
-}
-
-class AvroColumnWriter {
+struct WriteAvroBindData : public FunctionData {
 public:
-	virtual ~AvroColumnWriter() = default;
+	WriteAvroBindData(vector<AvroWriteSchema> columns_p, vector<AvroMetadataEntry> metadata_p, AvroCodec codec_p)
+	    : columns(std::move(columns_p)), metadata(std::move(metadata_p)), codec(codec_p) {
+	}
 
-	virtual void Prepare(Vector &vector) = 0;
-	virtual idx_t Write(avro_value_t *target, idx_t row) = 0;
+public:
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<WriteAvroBindData>(columns, metadata, codec);
+	}
 
-protected:
-	static idx_t WriteNull(avro_value_t *target, const LogicalType &type) {
-		auto union_value = *target;
-		avro_value_set_branch(&union_value, 0, target);
-		auto schema_type = avro_value_get_type(target);
-		if (schema_type != AVRO_NULL) {
-			throw InvalidInputException("Cannot insert NULL to non-nullable field of type %s",
-			                            LogicalTypeIdToString(type.id()));
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<WriteAvroBindData>();
+		if (metadata.size() != other.metadata.size()) {
+			return false;
 		}
-		avro_value_set_null(target);
+		for (idx_t i = 0; i < metadata.size(); i++) {
+			if (metadata[i].key != other.metadata[i].key || metadata[i].value != other.metadata[i].value) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+public:
+	vector<AvroWriteSchema> columns;
+	vector<AvroMetadataEntry> metadata;
+	AvroCodec codec;
+};
+
+int64_t AvroLongValue(int32_t value) {
+	return value;
+}
+
+int64_t AvroLongValue(int64_t value) {
+	return value;
+}
+
+int64_t AvroLongValue(date_t value) {
+	return Date::EpochDays(value);
+}
+
+int64_t AvroLongValue(dtime_t value) {
+	return value.value;
+}
+
+int64_t AvroLongValue(timestamp_t value) {
+	return value.value;
+}
+
+int64_t AvroLongValue(timestamp_tz_t value) {
+	return value.value;
+}
+
+int64_t AvroLongValue(timestamp_ns_t value) {
+	return value.value;
+}
+
+int64_t AvroLongValue(timestamp_ms_t value) {
+	return value.IsFinite() ? Timestamp::FromEpochMs(value.value).value : value.value;
+}
+
+struct AvroBooleanOp {
+	idx_t MaxSize() const {
 		return 1;
 	}
-
-	static avro_value_t *GetNonNullTarget(avro_value_t *target) {
-		auto union_value = *target;
-		avro_value_set_branch(&union_value, 1, target);
-		return target;
+	data_ptr_t Write(bool value, data_ptr_t out) const {
+		*out = value ? 1 : 0;
+		return out + 1;
 	}
 };
-
-template <typename T, typename ShiftT = T>
-static idx_t WriteDecimalAsFixedBytes(T value, uint8_t *bytes, const LogicalType &type) {
-	auto bytes_needed = MinBytesRequiredForDecimal(DecimalType::GetWidth(type));
-	auto type_bytes = static_cast<int>(sizeof(T));
-	auto start = type_bytes - static_cast<int>(bytes_needed);
-	for (int i = start; i < type_bytes; i++) {
-		bytes[i - start] = static_cast<uint8_t>(static_cast<ShiftT>(value >> ((type_bytes - i - 1) * 8)));
-	}
-	return bytes_needed;
-}
-
-static idx_t WriteBooleanValue(avro_value_t *target, const bool &value, const LogicalType &) {
-	avro_value_set_boolean(target, value);
-	return sizeof(bool);
-}
-
-static idx_t WriteBlobValue(avro_value_t *target, const string_t &value, const LogicalType &) {
-	avro_value_set_bytes(target, (void *)value.GetData(), value.GetSize());
-	return value.GetSize();
-}
-
-static idx_t WriteDoubleValue(avro_value_t *target, const double &value, const LogicalType &) {
-	avro_value_set_double(target, value);
-	return sizeof(double);
-}
-
-static idx_t WriteFloatValue(avro_value_t *target, const float &value, const LogicalType &) {
-	avro_value_set_float(target, value);
-	return sizeof(float);
-}
-
-static idx_t WriteIntegerValue(avro_value_t *target, const int32_t &value, const LogicalType &) {
-	avro_value_set_int(target, value);
-	return sizeof(int32_t);
-}
-
-static idx_t WriteBigIntValue(avro_value_t *target, const int64_t &value, const LogicalType &) {
-	avro_value_set_long(target, value);
-	return sizeof(int64_t);
-}
-
-static idx_t WriteStringValue(avro_value_t *target, const string_t &value, const LogicalType &) {
-	avro_value_set_string_len(target, value.GetData(), value.GetSize());
-	return value.GetSize();
-}
-
-static idx_t WriteDateValue(avro_value_t *target, const date_t &value, const LogicalType &) {
-	avro_value_set_int(target, Date::EpochDays(value));
-	return sizeof(int32_t);
-}
-
-static idx_t WriteTimeValue(avro_value_t *target, const dtime_t &value, const LogicalType &) {
-	avro_value_set_long(target, value.value);
-	return sizeof(int64_t);
-}
-
-static idx_t WriteTimestampValue(avro_value_t *target, const timestamp_t &value, const LogicalType &) {
-	avro_value_set_long(target, value.value);
-	return sizeof(int64_t);
-}
-
-static idx_t WriteTimestampTZValue(avro_value_t *target, const timestamp_tz_t &value, const LogicalType &) {
-	avro_value_set_long(target, value.value);
-	return sizeof(int64_t);
-}
-
-static idx_t WriteUUIDValue(avro_value_t *target, const hugeint_t &value, const LogicalType &) {
-	uint8_t bytes[16];
-	BaseUUID::ToBlob(value, data_ptr_cast(bytes));
-	avro_value_set_fixed(target, bytes, 16);
-	return 16;
-}
-
-template <typename T, typename ShiftT = T>
-static idx_t WriteDecimalValue(avro_value_t *target, const T &value, const LogicalType &type) {
-	uint8_t bytes[16];
-	auto byte_count = WriteDecimalAsFixedBytes<T, ShiftT>(value, bytes, type);
-	avro_value_set_fixed(target, bytes, byte_count);
-	return byte_count;
-}
 
 template <class T>
-class PrimitiveAvroColumnWriter : public AvroColumnWriter {
-public:
-	using WriteFunction = idx_t (*)(avro_value_t *, const T &, const LogicalType &);
-
-public:
-	PrimitiveAvroColumnWriter(LogicalType type, WriteFunction write_function)
-	    : type(std::move(type)), write_function(write_function) {
+struct AvroLongOp {
+	idx_t MaxSize() const {
+		return AVRO_MAX_VARINT_SIZE;
 	}
-
-	void Prepare(Vector &vector) override {
-		iterator = make_uniq<VectorIterator<T>>(vector);
+	data_ptr_t Write(const T &value, data_ptr_t out) const {
+		return out + AvroWriteLong(AvroLongValue(value), out);
 	}
-
-	idx_t Write(avro_value_t *target, idx_t row) override {
-		auto entry = (*iterator)[row];
-		if (!entry.IsValid()) {
-			return WriteNull(target, type);
-		}
-		return write_function(GetNonNullTarget(target), entry.GetValueUnsafe(), type);
-	}
-
-private:
-	LogicalType type;
-	WriteFunction write_function;
-	unique_ptr<VectorIterator<T>> iterator;
 };
 
-class NullAvroColumnWriter : public AvroColumnWriter {
-public:
-	explicit NullAvroColumnWriter(LogicalType type) : type(std::move(type)) {
+template <class T>
+struct AvroFloatOp {
+	idx_t MaxSize() const {
+		return sizeof(T);
 	}
-
-	void Prepare(Vector &) override {
+	data_ptr_t Write(T value, data_ptr_t out) const {
+		const auto bytes = BSwapIfBE(value);
+		memcpy(out, &bytes, sizeof(bytes));
+		return out + sizeof(bytes);
 	}
-
-	idx_t Write(avro_value_t *target, idx_t) override {
-		return WriteNull(target, type);
-	}
-
-private:
-	LogicalType type;
 };
 
-class StructAvroColumnWriter : public AvroColumnWriter {
-public:
-	StructAvroColumnWriter(LogicalType type, vector<idx_t> child_indexes, vector<unique_ptr<AvroColumnWriter>> children)
-	    : type(std::move(type)), child_indexes(std::move(child_indexes)), children(std::move(children)) {
+struct AvroBytesOp {
+	data_ptr_t Write(const string_t &value, data_ptr_t out) const {
+		const auto size = value.GetSize();
+		out += AvroWriteLong(UnsafeNumericCast<int64_t>(size), out);
+		memcpy(out, value.GetData(), size);
+		return out + size;
 	}
-
-	void Prepare(Vector &vector) override {
-		if (vector.GetVectorType() == VectorType::DICTIONARY_VECTOR) {
-			vector.Flatten();
-		}
-		validity = make_uniq<VectorValidityIterator>(vector);
-		auto &entries = StructVector::GetEntries(vector);
-		for (idx_t i = 0; i < children.size(); i++) {
-			children[i]->Prepare(entries[child_indexes[i]]);
-		}
-	}
-
-	idx_t Write(avro_value_t *target, idx_t row) override {
-		if (!validity->IsValid(row)) {
-			return WriteNull(target, type);
-		}
-		auto *non_null_target = GetNonNullTarget(target);
-		idx_t struct_value_size = 0;
-		for (idx_t i = 0; i < children.size(); i++) {
-			const char *unused_name;
-			avro_value_t field;
-			if (avro_value_get_by_index(non_null_target, i, &field, &unused_name)) {
-				throw InvalidInputException(avro_strerror());
-			}
-			struct_value_size += children[i]->Write(&field, row);
-		}
-		return struct_value_size + 1;
-	}
-
-private:
-	LogicalType type;
-	vector<idx_t> child_indexes;
-	vector<unique_ptr<AvroColumnWriter>> children;
-	unique_ptr<VectorValidityIterator> validity;
 };
 
-class ListAvroColumnWriter : public AvroColumnWriter {
+struct AvroUUIDOp {
+	idx_t MaxSize() const {
+		return AVRO_UUID_SIZE;
+	}
+	data_ptr_t Write(hugeint_t value, data_ptr_t out) const {
+		BaseUUID::ToBlob(value, out);
+		return out + AVRO_UUID_SIZE;
+	}
+};
+
+template <class T>
+struct AvroDecimalOp {
+	idx_t size;
+
+	idx_t MaxSize() const {
+		return size;
+	}
+	data_ptr_t Write(const T &value, data_ptr_t out) const {
+		if constexpr (std::is_same_v<T, hugeint_t>) {
+			const uint64_t bytes[] = {BSwapIfLE(static_cast<uint64_t>(value.upper)), BSwapIfLE(value.lower)};
+			memcpy(out, const_data_ptr_cast(bytes) + sizeof(bytes) - size, size);
+		} else {
+			const auto bytes = BSwapIfLE(static_cast<uint64_t>(static_cast<int64_t>(value)));
+			memcpy(out, const_data_ptr_cast(&bytes) + sizeof(bytes) - size, size);
+		}
+		return out + size;
+	}
+};
+
+class AvroColumnEncoder {
 public:
-	ListAvroColumnWriter(LogicalType type, unique_ptr<AvroColumnWriter> child_writer)
-	    : type(std::move(type)), child_writer(std::move(child_writer)) {
+	AvroColumnEncoder(Allocator &allocator, const AvroWriteSchema &schema)
+	    : type(schema.type), nullable(schema.nullable), buffer(allocator) {
+	}
+	virtual ~AvroColumnEncoder() = default;
+
+	virtual void Encode(const Vector &vector, idx_t count) = 0;
+
+	virtual const LogicalType &RejectedType(idx_t row) const {
+		return type;
 	}
 
-	void Prepare(Vector &vector) override {
-		vector.ToUnifiedFormat(format);
-		list_data = UnifiedVectorFormat::GetData<list_entry_t>(format);
-		auto &child = ListVector::GetChildMutable(vector);
-		child_writer->Prepare(child);
+	idx_t Size() const {
+		return ends.empty() ? 0 : ends.back();
 	}
 
-	idx_t Write(avro_value_t *target, idx_t row) override {
-		auto sel_idx = format.sel->get_index(row);
-		if (!format.validity.RowIsValid(sel_idx)) {
-			return WriteNull(target, type);
-		}
-
-		auto *non_null_target = GetNonNullTarget(target);
-		const auto &entry = list_data[sel_idx];
-		idx_t list_value_size = 0;
-		for (idx_t i = 0; i < entry.length; i++) {
-			avro_value_t item;
-			size_t unused_new_index;
-			if (avro_value_append(non_null_target, &item, &unused_new_index)) {
-				throw InvalidInputException(avro_strerror());
-			}
-			list_value_size += child_writer->Write(&item, entry.offset + i);
-		}
-		return list_value_size + 1;
+	idx_t RowsSize(idx_t begin, idx_t end) const {
+		return ends[end - 1] - RowStart(begin);
 	}
 
-private:
-	LogicalType type;
-	unique_ptr<AvroColumnWriter> child_writer;
+	data_ptr_t CopyRows(idx_t begin, idx_t end, data_ptr_t out) const {
+		const auto start = RowStart(begin);
+		const auto size = ends[end - 1] - start;
+		memcpy(out, encoded + start, size);
+		return out + size;
+	}
+
+	bool Rejects(idx_t row) const {
+		return std::binary_search(rejected.begin(), rejected.end(), row);
+	}
+
+public:
+	unsafe_vector<idx_t> rejected;
+
+protected:
+	data_ptr_t Start(idx_t count, idx_t capacity) {
+		ends.resize(count);
+		rejected.clear();
+		buffer.GrowCapacity(capacity);
+		encoded = buffer.GetData();
+		return encoded;
+	}
+
+	idx_t RowStart(idx_t row) const {
+		return row ? ends[row - 1] : 0;
+	}
+
+protected:
+	const LogicalType type;
+	const bool nullable;
+	unsafe_vector<idx_t> ends;
 	UnifiedVectorFormat format;
-	const list_entry_t *list_data = nullptr;
+
+private:
+	MemoryStream buffer;
+	data_ptr_t encoded = nullptr;
 };
 
-static unique_ptr<AvroColumnWriter> CreateAvroColumnWriter(const LogicalType &type) {
+unique_ptr<AvroColumnEncoder> CreateAvroEncoder(Allocator &allocator, const AvroWriteSchema &schema);
+
+template <class T, class OP>
+class AvroValueEncoder final : public AvroColumnEncoder {
+public:
+	AvroValueEncoder(Allocator &allocator, const AvroWriteSchema &schema, OP op_p = OP())
+	    : AvroColumnEncoder(allocator, schema), op(op_p) {
+	}
+
+	void Encode(const Vector &vector, idx_t count) override {
+		vector.ToUnifiedFormat(format);
+		const auto values = format.GetData<T>();
+		const auto base = Start(count, Capacity(values, count));
+		const auto row_ends = ends.data();
+		const auto sel = format.sel;
+		const auto &validity = format.validity;
+		const auto is_nullable = nullable;
+		auto out = base;
+		for (idx_t row = 0; row < count; row++) {
+			const auto idx = sel->get_index(row);
+			if (validity.RowIsValid(idx)) {
+				if (is_nullable) {
+					*out++ = AVRO_VALUE_BRANCH;
+				}
+				out = op.Write(values[idx], out);
+			} else if (is_nullable) {
+				*out++ = AVRO_NULL_BRANCH;
+			} else {
+				rejected.push_back(row);
+			}
+			row_ends[row] = UnsafeNumericCast<idx_t>(out - base);
+		}
+	}
+
+private:
+	idx_t Capacity(const T *values, idx_t count) const {
+		if constexpr (std::is_same_v<T, string_t>) {
+			auto result = count * (1 + AVRO_MAX_VARINT_SIZE);
+			for (idx_t row = 0; row < count; row++) {
+				const auto idx = format.sel->get_index(row);
+				if (format.validity.RowIsValid(idx)) {
+					result += values[idx].GetSize();
+				}
+			}
+			return result;
+		} else {
+			return count * (1 + op.MaxSize());
+		}
+	}
+
+private:
+	OP op;
+};
+
+class AvroNullEncoder final : public AvroColumnEncoder {
+public:
+	using AvroColumnEncoder::AvroColumnEncoder;
+
+	void Encode(const Vector &, idx_t count) override {
+		const auto base = Start(count, count);
+		const auto row_ends = ends.data();
+		auto out = base;
+		for (idx_t row = 0; row < count; row++) {
+			if (nullable) {
+				*out++ = AVRO_NULL_BRANCH;
+			}
+			row_ends[row] = UnsafeNumericCast<idx_t>(out - base);
+		}
+	}
+};
+
+class AvroStructEncoder final : public AvroColumnEncoder {
+public:
+	AvroStructEncoder(Allocator &allocator, const AvroWriteSchema &schema) : AvroColumnEncoder(allocator, schema) {
+		for (auto &child : schema.children) {
+			entries.push_back(child.entry);
+			children.push_back(CreateAvroEncoder(allocator, child));
+		}
+	}
+
+	void Encode(const Vector &vector, idx_t count) override {
+		vector.ToUnifiedFormat(format);
+		auto &child_vectors = StructVector::GetEntries(vector);
+		auto capacity = count;
+		auto children_rejected = false;
+		for (idx_t i = 0; i < children.size(); i++) {
+			children[i]->Encode(child_vectors[entries[i]], count);
+			capacity += children[i]->Size();
+			children_rejected = children_rejected || !children[i]->rejected.empty();
+		}
+		const auto base = Start(count, capacity);
+		const auto row_ends = ends.data();
+		const auto sel = format.sel;
+		const auto &validity = format.validity;
+		const auto is_nullable = nullable;
+		auto out = base;
+		for (idx_t row = 0; row < count; row++) {
+			const auto idx = sel->get_index(row);
+			if (validity.RowIsValid(idx)) {
+				if (is_nullable) {
+					*out++ = AVRO_VALUE_BRANCH;
+				}
+				for (auto &child : children) {
+					out = child->CopyRows(row, row + 1, out);
+				}
+				if (children_rejected && RejectingChild(row)) {
+					rejected.push_back(row);
+				}
+			} else if (is_nullable) {
+				*out++ = AVRO_NULL_BRANCH;
+			} else {
+				rejected.push_back(row);
+			}
+			row_ends[row] = UnsafeNumericCast<idx_t>(out - base);
+		}
+	}
+
+	const LogicalType &RejectedType(idx_t row) const override {
+		if (format.validity.RowIsValid(format.sel->get_index(row))) {
+			auto child = RejectingChild(row);
+			if (child) {
+				return child->RejectedType(row);
+			}
+		}
+		return type;
+	}
+
+private:
+	optional_ptr<const AvroColumnEncoder> RejectingChild(idx_t row) const {
+		for (auto &child : children) {
+			if (child->Rejects(row)) {
+				return child.get();
+			}
+		}
+		return nullptr;
+	}
+
+private:
+	unsafe_vector<idx_t> entries;
+	vector<unique_ptr<AvroColumnEncoder>> children;
+};
+
+class AvroListEncoder final : public AvroColumnEncoder {
+public:
+	AvroListEncoder(Allocator &allocator, const AvroWriteSchema &schema)
+	    : AvroColumnEncoder(allocator, schema), items(CreateAvroEncoder(allocator, schema.children[0])) {
+	}
+
+	void Encode(const Vector &vector, idx_t count) override {
+		vector.ToUnifiedFormat(format);
+		items->Encode(ListVector::GetChild(vector), ListVector::GetListSize(vector));
+		const auto lists = format.GetData<list_entry_t>();
+		const auto base = Start(count, Capacity(lists, count));
+		const auto row_ends = ends.data();
+		const auto sel = format.sel;
+		const auto &validity = format.validity;
+		const auto is_nullable = nullable;
+		const auto items_rejected = !items->rejected.empty();
+		auto out = base;
+		for (idx_t row = 0; row < count; row++) {
+			const auto idx = sel->get_index(row);
+			if (validity.RowIsValid(idx)) {
+				if (is_nullable) {
+					*out++ = AVRO_VALUE_BRANCH;
+				}
+				const auto &list = lists[idx];
+				if (list.length) {
+					out += AvroWriteLong(UnsafeNumericCast<int64_t>(list.length), out);
+					out = items->CopyRows(list.offset, list.offset + list.length, out);
+					if (items_rejected && RejectedItem(list).IsValid()) {
+						rejected.push_back(row);
+					}
+				}
+				*out++ = AVRO_ARRAY_END;
+			} else if (is_nullable) {
+				*out++ = AVRO_NULL_BRANCH;
+			} else {
+				rejected.push_back(row);
+			}
+			row_ends[row] = UnsafeNumericCast<idx_t>(out - base);
+		}
+	}
+
+	const LogicalType &RejectedType(idx_t row) const override {
+		const auto idx = format.sel->get_index(row);
+		if (format.validity.RowIsValid(idx)) {
+			auto item = RejectedItem(format.GetData<list_entry_t>()[idx]);
+			if (item.IsValid()) {
+				return items->RejectedType(item.GetIndex());
+			}
+		}
+		return type;
+	}
+
+private:
+	idx_t Capacity(const list_entry_t *lists, idx_t count) const {
+		auto result = count;
+		for (idx_t row = 0; row < count; row++) {
+			const auto idx = format.sel->get_index(row);
+			if (!format.validity.RowIsValid(idx)) {
+				continue;
+			}
+			const auto &list = lists[idx];
+			result += AVRO_MAX_VARINT_SIZE + 1;
+			if (list.length) {
+				result += items->RowsSize(list.offset, list.offset + list.length);
+			}
+		}
+		return result;
+	}
+
+	optional_idx RejectedItem(const list_entry_t &list) const {
+		auto &item_rows = items->rejected;
+		auto item = std::lower_bound(item_rows.begin(), item_rows.end(), list.offset);
+		if (item == item_rows.end() || *item >= list.offset + list.length) {
+			return optional_idx();
+		}
+		return optional_idx(*item);
+	}
+
+private:
+	unique_ptr<AvroColumnEncoder> items;
+};
+
+template <class T>
+unique_ptr<AvroColumnEncoder> CreateAvroDecimalEncoder(Allocator &allocator, const AvroWriteSchema &schema) {
+	AvroDecimalOp<T> op {MinBytesRequiredForDecimal(DecimalType::GetWidth(schema.type))};
+	return make_uniq<AvroValueEncoder<T, AvroDecimalOp<T>>>(allocator, schema, op);
+}
+
+unique_ptr<AvroColumnEncoder> CreateAvroEncoder(Allocator &allocator, const AvroWriteSchema &schema) {
+	auto &type = schema.type;
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
-		return make_uniq<PrimitiveAvroColumnWriter<bool>>(type, WriteBooleanValue);
-	case LogicalTypeId::BLOB:
-		return make_uniq<PrimitiveAvroColumnWriter<string_t>>(type, WriteBlobValue);
-	case LogicalTypeId::DOUBLE:
-		return make_uniq<PrimitiveAvroColumnWriter<double>>(type, WriteDoubleValue);
-	case LogicalTypeId::FLOAT:
-		return make_uniq<PrimitiveAvroColumnWriter<float>>(type, WriteFloatValue);
+		return make_uniq<AvroValueEncoder<bool, AvroBooleanOp>>(allocator, schema);
 	case LogicalTypeId::INTEGER:
-		return make_uniq<PrimitiveAvroColumnWriter<int32_t>>(type, WriteIntegerValue);
+		return make_uniq<AvroValueEncoder<int32_t, AvroLongOp<int32_t>>>(allocator, schema);
 	case LogicalTypeId::BIGINT:
-		return make_uniq<PrimitiveAvroColumnWriter<int64_t>>(type, WriteBigIntValue);
+		return make_uniq<AvroValueEncoder<int64_t, AvroLongOp<int64_t>>>(allocator, schema);
+	case LogicalTypeId::FLOAT:
+		return make_uniq<AvroValueEncoder<float, AvroFloatOp<float>>>(allocator, schema);
+	case LogicalTypeId::DOUBLE:
+		return make_uniq<AvroValueEncoder<double, AvroFloatOp<double>>>(allocator, schema);
 	case LogicalTypeId::VARCHAR:
-		return make_uniq<PrimitiveAvroColumnWriter<string_t>>(type, WriteStringValue);
+	case LogicalTypeId::BLOB:
+		return make_uniq<AvroValueEncoder<string_t, AvroBytesOp>>(allocator, schema);
 	case LogicalTypeId::DATE:
-		return make_uniq<PrimitiveAvroColumnWriter<date_t>>(type, WriteDateValue);
+		return make_uniq<AvroValueEncoder<date_t, AvroLongOp<date_t>>>(allocator, schema);
 	case LogicalTypeId::TIME:
-		return make_uniq<PrimitiveAvroColumnWriter<dtime_t>>(type, WriteTimeValue);
+		return make_uniq<AvroValueEncoder<dtime_t, AvroLongOp<dtime_t>>>(allocator, schema);
 	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS:
-		return make_uniq<PrimitiveAvroColumnWriter<timestamp_t>>(type, WriteTimestampValue);
+		return make_uniq<AvroValueEncoder<timestamp_t, AvroLongOp<timestamp_t>>>(allocator, schema);
 	case LogicalTypeId::TIMESTAMP_TZ:
-		return make_uniq<PrimitiveAvroColumnWriter<timestamp_tz_t>>(type, WriteTimestampTZValue);
+		return make_uniq<AvroValueEncoder<timestamp_tz_t, AvroLongOp<timestamp_tz_t>>>(allocator, schema);
+	case LogicalTypeId::TIMESTAMP_NS:
+		return make_uniq<AvroValueEncoder<timestamp_ns_t, AvroLongOp<timestamp_ns_t>>>(allocator, schema);
+	case LogicalTypeId::TIMESTAMP_MS:
+		return make_uniq<AvroValueEncoder<timestamp_ms_t, AvroLongOp<timestamp_ms_t>>>(allocator, schema);
 	case LogicalTypeId::UUID:
-		return make_uniq<PrimitiveAvroColumnWriter<hugeint_t>>(type, WriteUUIDValue);
+		return make_uniq<AvroValueEncoder<hugeint_t, AvroUUIDOp>>(allocator, schema);
 	case LogicalTypeId::DECIMAL:
 		switch (type.InternalType()) {
 		case PhysicalType::INT16:
-			return make_uniq<PrimitiveAvroColumnWriter<int16_t>>(type, WriteDecimalValue<int16_t>);
+			return CreateAvroDecimalEncoder<int16_t>(allocator, schema);
 		case PhysicalType::INT32:
-			return make_uniq<PrimitiveAvroColumnWriter<int32_t>>(type, WriteDecimalValue<int32_t>);
+			return CreateAvroDecimalEncoder<int32_t>(allocator, schema);
 		case PhysicalType::INT64:
-			return make_uniq<PrimitiveAvroColumnWriter<int64_t>>(type, WriteDecimalValue<int64_t>);
+			return CreateAvroDecimalEncoder<int64_t>(allocator, schema);
 		case PhysicalType::INT128:
-			return make_uniq<PrimitiveAvroColumnWriter<hugeint_t>>(type, WriteDecimalValue<hugeint_t, uhugeint_t>);
+			return CreateAvroDecimalEncoder<hugeint_t>(allocator, schema);
 		default:
 			throw NotImplementedException("Unsupported decimal physical type");
 		}
 	case LogicalTypeId::SQLNULL:
-		return make_uniq<NullAvroColumnWriter>(type);
-	case LogicalTypeId::STRUCT: {
-		vector<idx_t> child_indexes;
-		vector<unique_ptr<AvroColumnWriter>> child_writers;
-		auto &child_types = StructType::GetChildTypes(type);
-		for (idx_t i = 0; i < child_types.size(); i++) {
-			if (child_types[i].first == "__duckdb_empty_struct_marker") {
-				continue;
-			}
-			child_indexes.push_back(i);
-			child_writers.push_back(CreateAvroColumnWriter(child_types[i].second));
-		}
-		return make_uniq<StructAvroColumnWriter>(type, std::move(child_indexes), std::move(child_writers));
-	}
-	case LogicalTypeId::MAP:
+		return make_uniq<AvroNullEncoder>(allocator, schema);
+	case LogicalTypeId::STRUCT:
+		return make_uniq<AvroStructEncoder>(allocator, schema);
 	case LogicalTypeId::LIST:
-		return make_uniq<ListAvroColumnWriter>(type, CreateAvroColumnWriter(ListType::GetChildType(type)));
-	case LogicalTypeId::ENUM:
-		throw NotImplementedException("Can't convert ENUM Value to Avro yet");
+	case LogicalTypeId::MAP:
+		return make_uniq<AvroListEncoder>(allocator, schema);
 	default:
-		throw NotImplementedException("PopulateValue not implemented for type %s", type.ToString());
+		throw NotImplementedException("Can't convert logical type '%s' to Avro type", type.ToString());
 	}
 }
 
-WriteAvroLocalState::WriteAvroLocalState(FunctionData &bind_data_p) {
-	auto &bind_data = bind_data_p.Cast<WriteAvroBindData>();
-	column_writers.reserve(bind_data.types.size());
-	for (auto &type : bind_data.types) {
-		column_writers.push_back(CreateAvroColumnWriter(type));
-	}
-	if (avro_generic_value_new(bind_data.interface, &value)) {
-		throw InvalidInputException(avro_strerror());
-	}
-}
+class WriteAvroGlobalState;
 
-WriteAvroLocalState::~WriteAvroLocalState() {
-	avro_value_decref(&value);
-}
-
-static void WriteAvroSink(ExecutionContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate_p,
-                          LocalFunctionData &lstate_p, DataChunk &input) {
-	auto &global_state = gstate_p.Cast<WriteAvroGlobalState>();
-	auto &local_state = lstate_p.Cast<WriteAvroLocalState>();
-
-	for (idx_t col_idx = 0; col_idx < input.ColumnCount(); col_idx++) {
-		local_state.column_writers[col_idx]->Prepare(input.data[col_idx]);
+class WriteAvroLocalState : public LocalFunctionData {
+public:
+	WriteAvroLocalState(Allocator &allocator, const WriteAvroBindData &bind_data)
+	    : block(allocator), compressor(allocator, bind_data.codec), blocks(allocator) {
+		for (auto &column : bind_data.columns) {
+			columns.push_back(CreateAvroEncoder(allocator, column));
+		}
 	}
 
-	auto &datum_buffer = global_state.datum_buffer;
-	idx_t count = input.size();
-	idx_t offset_in_datum_buffer = 0;
-
-	for (idx_t i = 0; i < count; i++) {
-
-		//! Populate our avro value, estimating the size of the value as we go
-		idx_t value_size = 0;
-		for (idx_t col_idx = 0; col_idx < input.ColumnCount(); col_idx++) {
-			const char *unused_name;
-			avro_value_t column;
-			if (avro_value_get_by_index(&local_state.value, col_idx, &column, &unused_name)) {
-				throw InvalidInputException(avro_strerror());
+	void Sink(DataChunk &chunk) {
+		const auto count = chunk.size();
+		for (idx_t i = 0; i < columns.size(); i++) {
+			columns[i]->Encode(chunk.data[i], count);
+		}
+		ThrowRejected();
+		for (idx_t row = 0; row < count; row++) {
+			idx_t size = 0;
+			for (auto &column : columns) {
+				size += column->RowsSize(row, row + 1);
 			}
-			value_size += local_state.column_writers[col_idx]->Write(&column, i);
+			auto out = block.Alloc(size);
+			for (auto &column : columns) {
+				out = column->CopyRows(row, row + 1, out);
+			}
+			block_rows++;
+			if (block.GetPosition() >= AVRO_BLOCK_SIZE) {
+				FinishBlock();
+			}
 		}
+	}
 
-		//! Prepare the datum buffer for this row
-		idx_t length = datum_buffer.GetCapacity() - offset_in_datum_buffer;
-		if (value_size > length) {
-			//! This value is too big to fit into the remaining portion of the buffer
-			idx_t new_capacity = datum_buffer.GetCapacity();
-			new_capacity += value_size;
-			datum_buffer.ResizeAndCopy(NextPowerOfTwo(new_capacity));
+	void FinishBlock() {
+		if (!block_rows) {
+			return;
 		}
-		avro_writer_memory_set_dest_with_offset(global_state.datum_writer, (const char *)datum_buffer.GetData(),
-		                                        datum_buffer.GetCapacity(), offset_in_datum_buffer);
+		const auto compressed = compressor.Compress(const_char_ptr_cast(block.GetData()), block.GetPosition());
+		auto out = blocks.Alloc(2 * AVRO_MAX_VARINT_SIZE + compressed.size() + AVRO_SYNC_SIZE);
+		out += AvroWriteLong(NumericCast<int64_t>(block_rows), out);
+		out += AvroWriteLong(NumericCast<int64_t>(compressed.size()), out);
+		memcpy(out, compressed.data(), compressed.size());
+		out += compressed.size();
+		const auto sync = NumericCast<idx_t>(out - blocks.GetData());
+		syncs.push_back(sync);
+		blocks.SetPosition(sync + AVRO_SYNC_SIZE);
+		blocks_rows += block_rows;
+		block.Rewind();
+		block_rows = 0;
+	}
 
-		int ret;
-		while ((ret = avro_file_writer_append_value(global_state.file_writer.get(), &local_state.value)) == ENOSPC) {
-			auto current_capacity = datum_buffer.GetCapacity();
-			datum_buffer.ResizeAndCopy(NextPowerOfTwo(current_capacity * 2));
-			avro_writer_memory_set_dest_with_offset(global_state.datum_writer, (const char *)datum_buffer.GetData(),
-			                                        datum_buffer.GetCapacity(), offset_in_datum_buffer);
+	void Flush(WriteAvroGlobalState &global_state);
+
+private:
+	void ThrowRejected() const {
+		optional_ptr<const AvroColumnEncoder> column;
+		idx_t row = 0;
+		for (auto &encoder : columns) {
+			if (!encoder->rejected.empty() && (!column || encoder->rejected[0] < row)) {
+				column = encoder.get();
+				row = encoder->rejected[0];
+			}
 		}
-		if (ret) {
-			throw InvalidInputException(avro_strerror());
+		if (column) {
+			throw InvalidInputException("Cannot insert NULL to non-nullable field of type %s",
+			                            LogicalTypeIdToString(column->RejectedType(row).id()));
 		}
-
-		offset_in_datum_buffer = avro_writer_tell(global_state.datum_writer);
-		avro_value_reset(&local_state.value);
 	}
 
-	auto &buffer = global_state.memory_buffer;
-	auto expected_size = avro_writer_tell(global_state.datum_writer);
-	expected_size += WriteAvroGlobalState::SYNC_SIZE + WriteAvroGlobalState::MAX_ROW_COUNT_BYTES;
-	if (static_cast<idx_t>(expected_size) > buffer.GetCapacity()) {
-		//! Resize the buffer in advance, to prevent any need for resizing below
-		buffer.Resize(NextPowerOfTwo(expected_size));
-		avro_writer_memory_set_dest(global_state.writer, (const char *)buffer.GetData(), buffer.GetCapacity());
+private:
+	vector<unique_ptr<AvroColumnEncoder>> columns;
+	MemoryStream block;
+	idx_t block_rows = 0;
+	AvroCompressor compressor;
+	MemoryStream blocks;
+	unsafe_vector<idx_t> syncs;
+	idx_t blocks_rows = 0;
+};
+
+class WriteAvroGlobalState : public GlobalFunctionData {
+public:
+	WriteAvroGlobalState(ClientContext &context, const WriteAvroBindData &bind_data, const string &file_path)
+	    : file(context, file_path, FileCompressionType::AUTO_DETECT, string()) {
+		RandomEngine engine;
+		engine.RandomData(data_ptr_cast(sync), AVRO_SYNC_SIZE);
+		string header;
+		AvroWriteHeader(bind_data.metadata, sync, header);
+		file.WriteFrame(const_data_ptr_cast(header.data()), header.size());
 	}
 
-	//! Flush the contents to the buffer, if it fails, resize the buffer and try again
-	int ret;
-	while ((ret = avro_file_writer_flush(global_state.file_writer.get())) == ENOSPC) {
-		auto current_capacity = buffer.GetCapacity();
-		buffer.Resize(NextPowerOfTwo(current_capacity * 2));
-		avro_writer_memory_set_dest(global_state.writer, (const char *)buffer.GetData(), buffer.GetCapacity());
-	}
-	if (ret) {
-		throw InvalidInputException(avro_strerror());
+	void Write(const_data_ptr_t data, idx_t size, idx_t rows) {
+		file.WriteRows(data, size);
+		row_count += rows;
 	}
 
-	auto written_bytes = avro_writer_tell(global_state.writer);
-	global_state.WriteData(buffer.GetData(), written_bytes);
-	avro_writer_memory_set_dest(global_state.writer, (const char *)buffer.GetData(), buffer.GetCapacity());
-
-	//! Track rows written for RETURN_STATS `count`. Avro COPY is single-threaded
-	//! (REGULAR_COPY_TO_FILE), but guard with the same lock for consistency.
-	{
-		lock_guard<mutex> flock(global_state.lock);
-		global_state.row_count += count;
+	idx_t FileSize() {
+		return file.FileSize();
 	}
+
+	void Finalize() {
+		const auto size = file.Close();
+		if (written_stats) {
+			written_stats->file_size_bytes = size;
+			written_stats->row_count = row_count;
+		}
+	}
+
+	unique_ptr<WriteAvroLocalState> GetLocalState(ClientContext &context, const WriteAvroBindData &bind_data) {
+		{
+			lock_guard<mutex> guard(local_states_lock);
+			if (!local_states.empty()) {
+				auto result = std::move(local_states.back());
+				local_states.pop_back();
+				return result;
+			}
+		}
+		return make_uniq<WriteAvroLocalState>(Allocator::Get(context), bind_data);
+	}
+
+	void StoreLocalState(unique_ptr<WriteAvroLocalState> local_state) {
+		lock_guard<mutex> guard(local_states_lock);
+		local_states.push_back(std::move(local_state));
+	}
+
+public:
+	char sync[AVRO_SYNC_SIZE];
+	optional_ptr<CopyFunctionFileStatistics> written_stats;
+
+private:
+	CopyFileWriter file;
+	atomic<idx_t> row_count {0};
+	mutex local_states_lock;
+	vector<unique_ptr<WriteAvroLocalState>> local_states;
+};
+
+void WriteAvroLocalState::Flush(WriteAvroGlobalState &global_state) {
+	if (syncs.empty()) {
+		return;
+	}
+	for (auto offset : syncs) {
+		memcpy(blocks.GetData() + offset, global_state.sync, AVRO_SYNC_SIZE);
+	}
+	global_state.Write(blocks.GetData(), blocks.GetPosition(), blocks_rows);
+	blocks.Rewind();
+	syncs.clear();
+	blocks_rows = 0;
 }
 
-static void WriteAvroCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
-                             LocalFunctionData &lstate) {
-	return;
+struct WriteAvroBatchData : public PreparedBatchData {
+	WriteAvroBatchData(WriteAvroGlobalState &owner_p, unique_ptr<WriteAvroLocalState> local_state_p)
+	    : owner(owner_p), local_state(std::move(local_state_p)) {
+	}
+
+	WriteAvroGlobalState &owner;
+	unique_ptr<WriteAvroLocalState> local_state;
+};
+
+unique_ptr<FunctionData> WriteAvroBind(ClientContext &context, CopyFunctionBindInput &input,
+                                       const vector<Identifier> &names, const vector<LogicalType> &sql_types) {
+	auto &options = input.info.options;
+	identifier_set_t recognized;
+	auto user_metadata = ParseMetadata(options, recognized);
+	auto column_names = IdentifiersToStrings(names);
+	JSONSchemaGenerator generator(column_names, sql_types);
+	generator.ParseFieldIds(options, recognized);
+	generator.ParseRootName(options, recognized);
+	generator.ParseSanitizeFieldNames(options, recognized);
+	auto root = generator.Generate();
+	auto json_schema = CreateJSONSchema(root);
+	auto codec_name = ParseCodec(options, recognized);
+	VerifyRecognizedOptions(options, recognized);
+	VerifyFieldNames(root);
+	auto codec = codec_name.empty() ? AvroCodec::NONE : AvroCodecFromName(codec_name);
+
+	vector<AvroMetadataEntry> metadata;
+	metadata.push_back(AvroMetadataEntry {"avro.codec", string(AvroCodecName(codec))});
+	metadata.push_back(AvroMetadataEntry {"avro.schema", std::move(json_schema)});
+	for (auto &entry : user_metadata) {
+		metadata.push_back(std::move(entry));
+	}
+	return make_uniq<WriteAvroBindData>(std::move(root.children), std::move(metadata), codec);
 }
 
-static void WriteAvroFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+unique_ptr<GlobalFunctionData> WriteAvroInitializeGlobal(ClientContext &context, FunctionData &bind_data,
+                                                         const string &file_path) {
+	return make_uniq<WriteAvroGlobalState>(context, bind_data.Cast<WriteAvroBindData>(), file_path);
+}
+
+unique_ptr<LocalFunctionData> WriteAvroInitializeLocal(ExecutionContext &context, FunctionData &bind_data) {
+	return make_uniq<WriteAvroLocalState>(Allocator::Get(context.client), bind_data.Cast<WriteAvroBindData>());
+}
+
+void WriteAvroGetWrittenStatistics(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+                                   CopyFunctionFileStatistics &statistics) {
+	gstate.Cast<WriteAvroGlobalState>().written_stats = &statistics;
+}
+
+void WriteAvroSink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+                   LocalFunctionData &lstate, DataChunk &input) {
+	auto &local_state = lstate.Cast<WriteAvroLocalState>();
+	local_state.Sink(input);
+	local_state.Flush(gstate.Cast<WriteAvroGlobalState>());
+}
+
+void WriteAvroCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+                      LocalFunctionData &lstate) {
+	auto &local_state = lstate.Cast<WriteAvroLocalState>();
+	local_state.FinishBlock();
+	local_state.Flush(gstate.Cast<WriteAvroGlobalState>());
+}
+
+void WriteAvroFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+	gstate.Cast<WriteAvroGlobalState>().Finalize();
+}
+
+unique_ptr<PreparedBatchData> WriteAvroPrepareBatch(ClientContext &context, FunctionData &bind_data,
+                                                    GlobalFunctionData &gstate,
+                                                    unique_ptr<ColumnDataCollection> collection) {
 	auto &global_state = gstate.Cast<WriteAvroGlobalState>();
-	//! WriteAvroSink has already flushed every block to the file handle, so there is no
-	//! more data to write here. We only need to close the handle, which is required for
-	//! stores that commit on Close() (e.g. Azure DFS / OneLake, where Write() Appends
-	//! staged bytes that only become visible after Flush(Close=true)). Local FS, S3, and
-	//! Azure Blob are unaffected because their writes commit incrementally.
-	if (global_state.handle) {
-		global_state.handle->Close();
+	auto local_state = global_state.GetLocalState(context, bind_data.Cast<WriteAvroBindData>());
+	for (auto &chunk : collection->Chunks()) {
+		local_state->Sink(chunk);
 	}
+	local_state->FinishBlock();
+	return make_uniq<WriteAvroBatchData>(global_state, std::move(local_state));
+}
 
-	//! Populate RETURN_STATS now that the file is fully written. bytes_written is the exact,
-	//! incrementally-tracked file size (no HEAD probe); row_count is the number of rows sunk.
-	//! The other stat columns (footer_size_bytes, column_statistics) are not applicable to the
-	//! Avro object container and are left at their defaults.
-	if (global_state.written_stats) {
-		global_state.written_stats->file_size_bytes = global_state.BytesWritten();
-		global_state.written_stats->row_count = global_state.row_count;
+void WriteAvroFlushBatch(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+                         PreparedBatchData &batch) {
+	auto &avro_batch = batch.Cast<WriteAvroBatchData>();
+	avro_batch.local_state->Flush(gstate.Cast<WriteAvroGlobalState>());
+	avro_batch.owner.StoreLocalState(std::move(avro_batch.local_state));
+}
+
+idx_t WriteAvroFileSizeBytes(GlobalFunctionData &gstate) {
+	return gstate.Cast<WriteAvroGlobalState>().FileSize();
+}
+
+unique_ptr<FunctionData> ReadAvroCopyBind(ClientContext &context, CopyFromFunctionBindInput &input,
+                                          vector<Identifier> &expected_names, vector<LogicalType> &expected_types) {
+	auto info = input.info.Copy();
+	for (auto option : {"codec", "root_name", "field_ids", "sanitize_field_names", "metadata"}) {
+		info->options.erase(option);
 	}
+	CopyFromFunctionBindInput read_input(*info, input.tf);
+	return TableFunctionMultiFileWrapper::MultiFileBindCopyWith(context, read_input, expected_names, expected_types,
+	                                                            ReadAvro::GetSingleFileFunction(),
+	                                                            ReadAvro::GetMultiFileSettings());
 }
 
-CopyFunctionExecutionMode WriteAvroExecutionMode(bool preserve_insertion_order, bool supports_batch_index) {
-	//! For now we only support single-threaded writes to Avro
-	return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
-}
-
-static void WriteAvroGetWrittenStatistics(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
-                                          CopyFunctionFileStatistics &statistics) {
-	//! DuckDB calls this once, right after copy_to_initialize_global and BEFORE any rows are
-	//! written, so the file only contains its header at this point. Store the destination and
-	//! fill the real values in copy_to_finalize (after the file is fully written and closed),
-	//! mirroring the Parquet writer. Reporting BytesWritten() here would yield only the header
-	//! size. No file-size probe (HEAD) is needed: bytes_written is tracked incrementally.
-	auto &global_state = gstate.Cast<WriteAvroGlobalState>();
-	global_state.written_stats = &statistics;
-}
+} // namespace
 
 CopyFunction AvroCopyFunction::Create() {
 	CopyFunction function("avro");
 	function.extension = "avro";
 
+	function.copy_from_bind = ReadAvroCopyBind;
+	function.copy_from_function = *ReadAvro::GetFunctionSet().functions[0];
+
 	function.copy_to_bind = WriteAvroBind;
 	function.copy_to_initialize_local = WriteAvroInitializeLocal;
 	function.copy_to_initialize_global = WriteAvroInitializeGlobal;
+	function.copy_to_get_written_statistics = WriteAvroGetWrittenStatistics;
 	function.copy_to_sink = WriteAvroSink;
 	function.copy_to_combine = WriteAvroCombine;
 	function.copy_to_finalize = WriteAvroFinalize;
-	function.copy_to_get_written_statistics = WriteAvroGetWrittenStatistics;
-	function.execution_mode = WriteAvroExecutionMode;
+	function.execution_mode = CopyFunction::ParallelUnlessOrdered;
+	function.prepare_batch = WriteAvroPrepareBatch;
+	function.flush_batch = WriteAvroFlushBatch;
+	function.file_size_bytes = WriteAvroFileSizeBytes;
+	function.parallel_sink = true;
 	return function;
 }
 

@@ -1,0 +1,77 @@
+# name: test/sql/reader/corrupt_header.test
+# description: read_avro rejects a file whose header ends early, holds a number or a length it cannot read, or lacks a schema
+# group: [reader]
+
+require avro
+
+statement ok
+COPY (SELECT 'Obj'::BLOB) TO '{TEST_DIR}/header_three_bytes.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/header_three_bytes.avro')
+----
+Incorrect Avro container file magic number
+
+statement ok
+COPY (SELECT 'Obj\x01\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x00'::BLOB) TO '{TEST_DIR}/header_long_number.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/header_long_number.avro')
+----
+Avro file header has an invalid number
+
+statement ok
+COPY (SELECT 'Obj\x01\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x01'::BLOB) TO '{TEST_DIR}/header_min_count.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/header_min_count.avro')
+----
+Avro file header has an invalid metadata count
+
+statement ok
+COPY (SELECT 'Obj\x01\x02\x01'::BLOB) TO '{TEST_DIR}/header_negative_length.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/header_negative_length.avro')
+----
+Avro file header has a negative length
+
+statement ok
+COPY (SELECT 'Obj\x01\x02\x14avro.codec\x08null\x00\x5D\x4E\x1A\xC0\xFF\xEE\x7A\x1B\x2C\x3D\x4E\x5F\x60\x71\x82\x93'::BLOB) TO '{TEST_DIR}/header_no_schema.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/header_no_schema.avro')
+----
+Avro file header has no "avro.schema"
+
+statement ok
+COPY (SELECT 'Obj\x01\x80'::BLOB) TO '{TEST_DIR}/header_cut_in_count.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/header_cut_in_count.avro')
+----
+header_cut_in_count.avro" ends inside its header
+
+statement ok
+COPY (SELECT 'Obj\x01\x01'::BLOB) TO '{TEST_DIR}/header_cut_in_byte_size.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/header_cut_in_byte_size.avro')
+----
+header_cut_in_byte_size.avro" ends inside its header
+
+statement ok
+COPY (SELECT 'Obj\x01\x02\x80'::BLOB) TO '{TEST_DIR}/header_cut_in_key.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/header_cut_in_key.avro')
+----
+header_cut_in_key.avro" ends inside its header
+
+statement ok
+COPY (SELECT 'Obj\x01\x02\x16avro.schema\x0C"long"\x00\x5D\x4E\x1A\xC0'::BLOB) TO '{TEST_DIR}/header_cut_in_sync.avro' (FORMAT BLOB)
+
+statement error
+FROM read_avro('{TEST_DIR}/header_cut_in_sync.avro')
+----
+header_cut_in_sync.avro" ends inside its header

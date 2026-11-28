@@ -1,0 +1,65 @@
+# name: test/sql/reader/range_split.test
+# description: read_avro splits a file into byte ranges by sync marker - a block much larger than a range belongs to the range it starts in, a sync marker inside a block's data does not start a block, and a range without a block start yields nothing, also when its search ends on a copy of the marker's first byte
+# group: [reader]
+
+require avro
+
+statement ok
+SET threads=16
+
+query IIII
+SELECT count(*), sum(id), sum(octet_length(payload)), count(DISTINCT id) FROM read_avro('test/reader/big_block.avro')
+----
+200000	19999900000	3900000	200000
+
+query I
+SELECT count(*) FROM read_avro('test/reader/big_block.avro')
+----
+200000
+
+# every record's payload carries the file's sync marker
+query IIII
+SELECT count(*), sum(id), sum(octet_length(payload)), count(DISTINCT id) FROM read_avro('test/reader/false_sync.avro')
+----
+60000	1799970000	2490000	60000
+
+query I
+SELECT count(*) FROM read_avro('test/reader/false_sync.avro')
+----
+60000
+
+query II
+SELECT count(*), sum(id) FROM read_avro('test/reader/false_sync.avro') WHERE id % 1000 = 999
+----
+60	1829940
+
+statement ok
+CREATE MACRO avro_long(n) AS from_hex(CASE
+	WHEN n < 64 THEN printf('%02x', 2 * n)
+	WHEN n < 8192 THEN printf('%02x%02x', 2 * n % 128 + 128, 2 * n // 128)
+	WHEN n < 1048576 THEN printf('%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384)
+	ELSE printf('%02x%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384 % 128 + 128, 2 * n // 2097152)
+END)
+
+statement ok
+COPY (
+	SELECT header_data || '\x02'::BLOB || avro_long(octet_length(record_data)) || record_data || sync
+	FROM (
+		SELECT header_data, sync, '\x00'::BLOB || avro_long(octet_length(word)) || word AS record_data
+		FROM (
+			SELECT content AS header_data, sync, encode(repeat('a', 1048576)) || sync || encode(repeat('a', 100)) || ']'::BLOB AS word
+			FROM read_blob('test/reader/header_only.avro'), (SELECT '\x5D\x4E\x1A\xC0\xFF\xEE\x7A\x1B\x2C\x3D\x4E\x5F\x60\x71\x82\x93'::BLOB AS sync)
+		)
+	)
+) TO '{TEST_DIR}/range_without_block.avro' (FORMAT BLOB)
+
+# one block spans both ranges; the second range holds a false sync marker, and its search ends on a copy of the marker's first byte
+query II
+SELECT count(*), sum(id) FROM read_avro('{TEST_DIR}/range_without_block.avro')
+----
+1	0
+
+query I
+SELECT count(*) FROM read_avro('{TEST_DIR}/range_without_block.avro')
+----
+1

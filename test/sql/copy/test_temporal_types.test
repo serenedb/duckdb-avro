@@ -153,3 +153,23 @@ ORDER BY date_col NULLS LAST;
 ----
 2024-01-15	12:34:56	2024-01-15 12:34:56	2024-01-15 12:34:56+00	2023-01-15 12:12:12.123456789
 NULL	NULL	NULL	NULL	NULL
+
+# ---- TIMESTAMP_MS is written as timestamp-micros ----
+
+statement ok
+COPY (
+    FROM VALUES ('2024-01-15 12:34:56.789'::TIMESTAMP_MS), ('1969-12-31 23:59:59.999'::TIMESTAMP_MS), ('infinity'::TIMESTAMP_MS), (NULL) t(ts_ms_col)
+) TO '{TEST_DIR}/timestamp_ms.avro';
+
+query I
+SELECT typeof(ts_ms_col) FROM read_avro('{TEST_DIR}/timestamp_ms.avro') LIMIT 1;
+----
+TIMESTAMP
+
+query I
+SELECT ts_ms_col FROM read_avro('{TEST_DIR}/timestamp_ms.avro') ORDER BY ts_ms_col NULLS LAST;
+----
+1969-12-31 23:59:59.999
+2024-01-15 12:34:56.789
+infinity
+NULL

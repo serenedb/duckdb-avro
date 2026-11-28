@@ -1,30 +1,18 @@
 #include "avro_extension.hpp"
 
-#include "duckdb.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/common/string_util.hpp"
-#include "duckdb/function/scalar_function.hpp"
-
-#include "duckdb/main/extension/extension_loader.hpp"
-#include "include/avro_reader.hpp"
-#include "duckdb/common/multi_file/multi_file_reader.hpp"
-#include "avro_multi_file_info.hpp"
-#include "duckdb/common/multi_file/multi_file_function.hpp"
 #include "avro_copy.hpp"
-#include "include/avro_metadata.hpp"
-
-#include <avro.h>
+#include "avro_metadata.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "read_avro.hpp"
 
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
-	// Register a scalar function
-	auto table_function = MultiFileFunction<AvroMultiFileInfo>("read_avro");
-	table_function.projection_pushdown = true;
-	loader.RegisterFunction(MultiFileReader::CreateFunctionSet(table_function));
-
+	loader.RegisterFunction(ReadAvro::GetFunctionSet());
 	loader.RegisterFunction(AvroMetadata::GetFunction());
 	loader.RegisterFunction(AvroCopyFunction::Create());
+	DBConfig::GetConfig(loader.GetDatabaseInstance()).replacement_scans.emplace_back(ReadAvro::Replacement);
 }
 
 void AvroExtension::Load(ExtensionLoader &loader) {

@@ -1,0 +1,115 @@
+# name: test/sql/reader/codecs.test
+# description: read_avro decodes the same rows from files Apache avro wrote with every codec, each in 260 blocks, and zstandard blocks of several frames or larger than their first output buffer
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/codec_null.avro'))
+----
+id	BIGINT
+word	VARCHAR
+payload	BLOB
+score	DOUBLE
+tags	VARCHAR[]
+
+query IIIII
+SELECT * FROM read_avro('test/reader/codec_null.avro') WHERE id < 4 OR id = 2999 ORDER BY id
+----
+0	row-00000	(empty)	NULL	[]
+1	row-00001x	\x1F	0.25	[t1]
+2	row-00002xx	>?	0.5	[t2, t3]
+3	row-00003xxx	]^_	0.75	[t3, t4, t5]
+2999	row-02999xxxxxxxxx	)*+,-./	749.75	[t9, t10, t11]
+
+query IIIIIIIII
+SELECT count(*), sum(id), min(id), max(id), sum(length(word)), sum(octet_length(payload)), count(score), sum(score), sum(len(tags))
+FROM read_avro('test/reader/codec_null.avro')
+----
+3000	4498500	0	2999	59935	23964	2571	963964.5	4500
+
+query IIIIIIIII
+SELECT count(*), sum(id), min(id), max(id), sum(length(word)), sum(octet_length(payload)), count(score), sum(score), sum(len(tags))
+FROM read_avro('test/reader/codec_deflate.avro')
+----
+3000	4498500	0	2999	59935	23964	2571	963964.5	4500
+
+query I
+SELECT count(*) FROM (
+	SELECT * FROM read_avro('test/reader/codec_deflate.avro')
+	EXCEPT ALL
+	SELECT * FROM read_avro('test/reader/codec_null.avro')
+)
+----
+0
+
+query IIIIIIIII
+SELECT count(*), sum(id), min(id), max(id), sum(length(word)), sum(octet_length(payload)), count(score), sum(score), sum(len(tags))
+FROM read_avro('test/reader/codec_snappy.avro')
+----
+3000	4498500	0	2999	59935	23964	2571	963964.5	4500
+
+query I
+SELECT count(*) FROM (
+	SELECT * FROM read_avro('test/reader/codec_snappy.avro')
+	EXCEPT ALL
+	SELECT * FROM read_avro('test/reader/codec_null.avro')
+)
+----
+0
+
+query IIIIIIIII
+SELECT count(*), sum(id), min(id), max(id), sum(length(word)), sum(octet_length(payload)), count(score), sum(score), sum(len(tags))
+FROM read_avro('test/reader/codec_zstandard.avro')
+----
+3000	4498500	0	2999	59935	23964	2571	963964.5	4500
+
+query I
+SELECT count(*) FROM (
+	SELECT * FROM read_avro('test/reader/codec_zstandard.avro')
+	EXCEPT ALL
+	SELECT * FROM read_avro('test/reader/codec_null.avro')
+)
+----
+0
+
+query IIIIIIIII
+SELECT count(*), sum(id), min(id), max(id), sum(length(word)), sum(octet_length(payload)), count(score), sum(score), sum(len(tags))
+FROM read_avro('test/reader/codec_zstandard_no_content_size.avro')
+----
+3000	4498500	0	2999	59935	23964	2571	963964.5	4500
+
+query I
+SELECT count(*) FROM (
+	SELECT * FROM read_avro('test/reader/codec_zstandard_no_content_size.avro')
+	EXCEPT ALL
+	SELECT * FROM read_avro('test/reader/codec_null.avro')
+)
+----
+0
+
+query II
+SELECT count(*), sum(id) FROM read_avro([
+	'test/reader/codec_null.avro',
+	'test/reader/codec_deflate.avro',
+	'test/reader/codec_snappy.avro',
+	'test/reader/codec_zstandard.avro',
+	'test/reader/codec_zstandard_no_content_size.avro'
+])
+----
+15000	22492500
+
+statement error
+SELECT * FROM read_avro('test/reader/codec_bzip2.avro')
+----
+Unknown codec bzip2
+
+query III
+SELECT count(*), sum(id), list(word ORDER BY id) FROM read_avro('test/reader/codec_zstandard_frames.avro')
+----
+5	10	[word 0, word 1, word 2, word 3, word 4]
+
+query II
+SELECT count(*), sum(n) FROM read_avro('test/reader/codec_zstandard_large.avro')
+----
+100000	100000

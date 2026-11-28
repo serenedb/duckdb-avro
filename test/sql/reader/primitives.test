@@ -1,0 +1,69 @@
+# name: test/sql/reader/primitives.test
+# description: read_avro reads every Avro primitive type, with extreme values and varint length boundaries
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/primitives.avro'))
+----
+id	INTEGER
+f_null	"NULL"
+f_boolean	BOOLEAN
+f_int	INTEGER
+f_long	BIGINT
+f_float	FLOAT
+f_double	DOUBLE
+f_bytes	BLOB
+f_string	VARCHAR
+
+query IIIIIII
+SELECT id, f_null, f_boolean, f_int, f_long, f_float, f_double FROM read_avro('test/reader/primitives.avro') ORDER BY id
+----
+0	NULL	0	0	0	0	0
+1	NULL	1	1	1	1.5	1.5
+2	NULL	0	-1	-1	-2.25	-2.25
+3	NULL	1	2147483647	9223372036854775807	3.4028235e+38	1.7976931348623157e+308
+4	NULL	0	-2147483648	-9223372036854775808	-3.4028235e+38	-1.7976931348623157e+308
+5	NULL	1	63	64	1e-45	5e-324
+6	NULL	0	-64	-65	inf	-inf
+7	NULL	1	8191	-8193	nan	nan
+8	NULL	0	-8192	1099511627776	-0	-0
+
+query II
+SELECT
+	list(f_float ORDER BY id) = ['0', '1.5', '-2.25', '3.4028235e38', '-3.4028235e38', '1e-45', 'inf', 'nan', '-0']::FLOAT[],
+	list(f_double ORDER BY id) = ['0', '1.5', '-2.25', '1.7976931348623157e308', '-1.7976931348623157e308', '5e-324', '-inf', 'nan', '-0']::DOUBLE[]
+FROM read_avro('test/reader/primitives.avro')
+----
+1	1
+
+query IIII
+SELECT id, signbit(f_float), signbit(f_double), isnan(f_float) FROM read_avro('test/reader/primitives.avro') WHERE id IN (0, 7, 8) ORDER BY id
+----
+0	0	0	0
+7	0	0	1
+8	1	1	0
+
+query III
+SELECT id, f_bytes, f_string FROM read_avro('test/reader/primitives.avro') WHERE id <> 6 ORDER BY id
+----
+0	(empty)	(empty)
+1	\x00	a
+2	\xFF\xFE\xFD	Größe
+3	\x00\x01\x7F\x80\xFE\xFF	€uro
+4	quote\x27double\x22back\x5Cslash	🦆 duck
+5	!\x22#$%&\x27()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\x5C]^_`abcdefghijklmnopqrstuvwxyz{|}~	a string longer than twelve bytes
+7	\x80\x80\x80	ascii
+8	tail	末尾
+
+query IIII
+SELECT octet_length(f_bytes), f_bytes = repeat('x', 200)::BLOB, length(f_string), f_string = repeat('s', 150)
+FROM read_avro('test/reader/primitives.avro') WHERE id = 6
+----
+200	1	150	1
+
+query II
+SELECT sum(strlen(f_string)), sum(length(f_string)) FROM read_avro('test/reader/primitives.avro')
+----
+217	206

@@ -1,0 +1,25 @@
+# name: test/sql/reader/logical_duration.test
+# description: read_avro reads duration on fixed(12), three little-endian unsigned months, days and milliseconds, as INTERVAL
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/logical_duration.avro'))
+----
+id	INTEGER
+dur	INTERVAL
+
+query II
+SELECT * FROM read_avro('test/reader/logical_duration.avro') ORDER BY id
+----
+0	00:00:00
+1	1 mon 1 day 00:00:00.001
+2	1 year
+3	1 year 2 mons 3 days 01:02:03.004
+4	30 days
+5	24:00:00
+6	1193:02:47.295
+7	1409088 years 4 mons 84281096 days 42:07:33.132
+8	178956970 years 7 mons 2147483647 days 1193:02:47.295
+9	NULL

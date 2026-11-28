@@ -1,0 +1,56 @@
+# name: test/sql/reader/enums_and_fixed.test
+# description: read_avro reads enums, also with more than 256 or 65536 symbols and by name in a union, and fixed of several sizes
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/enums_and_fixed.avro')) WHERE column_name <> 'big'
+----
+id	INTEGER
+suit	ENUM('SPADES', 'HEARTS', 'DIAMONDS', 'CLUBS')
+maybe_suit	ENUM('SPADES', 'HEARTS', 'DIAMONDS', 'CLUBS')
+f1	BLOB
+f3	BLOB
+f16	BLOB
+
+query IIII
+SELECT len(enum_range(big)), enum_first(big), enum_last(big), enum_range(big)[129] FROM read_avro('test/reader/enums_and_fixed.avro') LIMIT 1
+----
+300	S000	S299	S128
+
+query IIIIIIIIII
+SELECT id, suit, enum_code(suit), maybe_suit, big, enum_code(big), f1, f3, f16, octet_length(f16) FROM read_avro('test/reader/enums_and_fixed.avro') ORDER BY id
+----
+0	SPADES	0	NULL	S000	0	\x00	abc	NULL	NULL
+1	HEARTS	1	SPADES	S063	63	\x7F	\x00\x00\x00	\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F	16
+2	DIAMONDS	2	CLUBS	S064	64	\x80	\xFF\xFE\xFD	\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF	16
+3	CLUBS	3	HEARTS	S255	255	\xFF	x,y	0123456789abcdef	16
+4	SPADES	0	DIAMONDS	S256	256	a	\x27\x22\x5C	\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00	16
+5	CLUBS	3	NULL	S299	299	~	end	NULL	NULL
+
+statement ok
+CREATE MACRO avro_long(n) AS from_hex(CASE
+	WHEN n < 64 THEN printf('%02x', 2 * n)
+	WHEN n < 8192 THEN printf('%02x%02x', 2 * n % 128 + 128, 2 * n // 128)
+	WHEN n < 1048576 THEN printf('%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384)
+	ELSE printf('%02x%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384 % 128 + 128, 2 * n // 2097152)
+END)
+
+statement ok
+COPY (
+	SELECT 'Obj\x01\x02\x16avro.schema'::BLOB || avro_long(strlen(schema_text)) || encode(schema_text) || '\x00'::BLOB || sync
+		|| '\x02'::BLOB || avro_long(octet_length(record_data)) || record_data || sync
+	FROM (
+		SELECT
+			'{"type":"enum","name":"wide","symbols":[' || string_agg('"s' || i::VARCHAR || '"', ',' ORDER BY i) || ']}' AS schema_text,
+			avro_long(65536) AS record_data,
+			'\x5D\x4E\x1A\xC0\xFF\xEE\x7A\x1B\x2C\x3D\x4E\x5F\x60\x71\x82\x93'::BLOB AS sync
+		FROM range(65537) t(i)
+	)
+) TO '{TEST_DIR}/wide_enum.avro' (FORMAT BLOB)
+
+query III
+SELECT wide, enum_code(wide), len(enum_range(wide)) FROM read_avro('{TEST_DIR}/wide_enum.avro')
+----
+s65536	65536	65537

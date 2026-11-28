@@ -1,0 +1,30 @@
+# name: test/sql/reader/field_ids.test
+# description: read_avro reads Iceberg schemas with field ids, element and key/value ids, and arrays of key/value records with logicalType map
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/field_ids.avro'))
+----
+id	BIGINT
+word	VARCHAR
+point	STRUCT(x INTEGER, y INTEGER)
+nums	BIGINT[]
+props	MAP(VARCHAR, VARCHAR)
+id_map	MAP(INTEGER, BIGINT)
+str_map	MAP(VARCHAR, STRUCT(z INTEGER))
+
+query IIIIIII
+SELECT * FROM read_avro('test/reader/field_ids.avro') ORDER BY id
+----
+1	a	{'x': 1, 'y': 2}	[1, 2, 3]	{p=q, n=NULL}	{1=10, 2=NULL}	{k={'z': 5}, l={'z': -5}}
+2	NULL	{'x': -1, 'y': -2}	[]	{}	{}	NULL
+3	c	{'x': 0, 'y': 0}	[-9223372036854775808]	{only=one}	{-2147483648=9223372036854775807}	{}
+
+query IIII
+SELECT id, id_map[1], id_map[2], str_map['l'].z FROM read_avro('test/reader/field_ids.avro') ORDER BY id
+----
+1	10	NULL	-5
+2	NULL	NULL	NULL
+3	NULL	NULL	NULL

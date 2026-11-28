@@ -1,0 +1,112 @@
+# name: test/sql/remote_lookup_edge.test
+# description: a lookup over HTTP returns NULLs for null root records and skips them, reads a block that starts at the end of its window or of the file, reuses the buffer of an earlier block, and reports corrupt data that the scan before it did not decode
+# group: [sql]
+
+require avro
+
+require httpfs
+
+require-env PYTHON_HTTP_SERVER_URL
+
+require-env PYTHON_HTTP_SERVER_DIR
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+SET threads=1
+
+statement ok
+CREATE MACRO avro_long(n) AS from_hex(CASE
+	WHEN n < 64 THEN printf('%02x', 2 * n)
+	WHEN n < 8192 THEN printf('%02x%02x', 2 * n % 128 + 128, 2 * n // 128)
+	WHEN n < 1048576 THEN printf('%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384)
+	ELSE printf('%02x%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384 % 128 + 128, 2 * n // 2097152)
+END)
+
+statement ok
+COPY (SELECT content FROM read_blob('test/reader/root_union.avro')) TO '{PYTHON_HTTP_SERVER_DIR}/lookup_edge_root_union.avro' (FORMAT BLOB)
+
+query II
+EXPLAIN SELECT a FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_edge_root_union.avro') ORDER BY file_row_number LIMIT 4
+----
+physical_plan	<REGEX>:.*LOOKUP_JOIN.*
+
+query I
+SELECT a FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_edge_root_union.avro') ORDER BY file_row_number LIMIT 4
+----
+NULL
+1
+NULL
+NULL
+
+query I
+SELECT b FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_edge_root_union.avro') ORDER BY file_row_number DESC LIMIT 1
+----
+z
+
+statement ok
+COPY (SELECT content FROM read_blob('test/reader/lookup_tail.avro')) TO '{PYTHON_HTTP_SERVER_DIR}/lookup_edge_tail.avro' (FORMAT BLOB)
+
+query I
+SELECT id FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_edge_tail.avro') ORDER BY file_row_number DESC LIMIT 2
+----
+5
+4
+
+statement ok
+COPY (
+	SELECT 'Obj\x01\x02\x16avro.schema'::BLOB || avro_long(strlen(schema_text)) || encode(schema_text) || '\x00'::BLOB || sync
+		|| '\x02'::BLOB || avro_long(octet_length(record_data)) || record_data || sync
+		|| '\x02\x06\x02\x02b'::BLOB || sync
+	FROM (
+		SELECT
+			'{"type":"record","name":"w","fields":[{"name":"id","type":"long"},{"name":"b","type":"bytes"}]}' AS schema_text,
+			'\x00'::BLOB || avro_long(65506) || encode(repeat('a', 65506)) AS record_data,
+			'\x5D\x4E\x1A\xC0\xFF\xEE\x7A\x1B\x2C\x3D\x4E\x5F\x60\x71\x82\x93'::BLOB AS sync
+	)
+) TO '{PYTHON_HTTP_SERVER_DIR}/lookup_edge_window.avro' (FORMAT BLOB)
+
+# the first block takes all but the last 6 bytes of the 64 KiB the lookup reads from its start
+query II
+SELECT id, octet_length(b) FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_edge_window.avro') ORDER BY file_row_number DESC LIMIT 2
+----
+1	1
+0	65506
+
+statement ok
+SET late_materialization_lookup_max_rows=5000
+
+statement ok
+COPY (SELECT i AS id, CASE WHEN i = 0 THEN repeat('x', 300000)::BLOB END AS pad, i * 2 AS v FROM range(30000) t(i)) TO '{PYTHON_HTTP_SERVER_DIR}/lookup_edge_reuse.avro' (FORMAT avro)
+
+query II
+EXPLAIN SELECT id, v FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_edge_reuse.avro') ORDER BY id LIMIT 3000
+----
+physical_plan	<REGEX>:.*LOOKUP_JOIN.*
+
+query II
+SELECT count(*), sum(v) FROM (SELECT id, v FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_edge_reuse.avro') ORDER BY id LIMIT 3000)
+----
+3000	8997000
+
+statement ok
+COPY (SELECT content FROM read_blob('test/reader/corrupt_deflate.avro')) TO '{PYTHON_HTTP_SERVER_DIR}/lookup_edge_corrupt_deflate.avro' (FORMAT BLOB)
+
+query I
+SELECT count(*) FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_edge_corrupt_deflate.avro')
+----
+10
+
+statement error
+SELECT * FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_edge_corrupt_deflate.avro') ORDER BY file_row_number DESC LIMIT 1
+----
+lookup_edge_corrupt_deflate.avro" is corrupt at the block at offset 240: Avro deflate block is corrupt: invalid block type
+
+statement ok
+COPY (SELECT content FROM read_blob('test/reader/corrupt_utf8.avro')) TO '{PYTHON_HTTP_SERVER_DIR}/lookup_edge_corrupt_utf8.avro' (FORMAT BLOB)
+
+statement error
+SELECT * FROM read_avro('{PYTHON_HTTP_SERVER_URL}/lookup_edge_corrupt_utf8.avro') ORDER BY file_row_number LIMIT 3
+----
+lookup_edge_corrupt_utf8.avro" is corrupt at the block at offset 191: a string is not valid UTF-8

@@ -1,27 +1,42 @@
 #pragma once
 
 #include "duckdb/common/types.hpp"
-#include <avro.h>
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/multi_file/multi_file_data.hpp"
 
 namespace duckdb {
 
+enum class AvroKind : uint8_t {
+	NULL_TYPE,
+	BOOLEAN,
+	INT,
+	LONG,
+	FLOAT,
+	DOUBLE,
+	BYTES,
+	STRING,
+	RECORD,
+	ENUM,
+	ARRAY,
+	MAP,
+	UNION,
+	FIXED
+};
+
+enum class AvroTimeUnit : uint8_t { NONE, MILLIS, MICROS, NANOS };
+
 struct AvroType {
 public:
 	AvroType() : duckdb_type(LogicalType::INVALID) {
 	}
-	AvroType(avro_type_t avro_type_p, LogicalType duckdb_type_p, child_list_t<AvroType> children_p = {},
+	AvroType(AvroKind kind_p, LogicalType duckdb_type_p, child_list_t<AvroType> children_p = {},
 	         unordered_map<idx_t, optional_idx> union_child_map_p = {})
-	    : duckdb_type(duckdb_type_p), avro_type(avro_type_p), children(children_p), union_child_map(union_child_map_p) {
+	    : duckdb_type(std::move(duckdb_type_p)), kind(kind_p), children(std::move(children_p)),
+	      union_child_map(std::move(union_child_map_p)) {
 	}
 
 public:
-	bool operator==(const AvroType &other) const {
-		return duckdb_type == other.duckdb_type && avro_type == other.avro_type && children == other.children &&
-		       union_child_map == other.union_child_map && is_timestamp_millis == other.is_timestamp_millis;
-	}
 	bool HasFieldId() const {
 		return field_id != NumericLimits<int32_t>::Maximum();
 	}
@@ -54,7 +69,7 @@ public:
 		}
 		case LogicalTypeId::MAP:
 		case LogicalTypeId::LIST: {
-			if (avro_type.avro_type == AVRO_ARRAY) {
+			if (avro_type.kind == AvroKind::ARRAY) {
 				auto element = TransformAvroType("list", avro_type.children[0].second);
 				if (id == LogicalTypeId::MAP) {
 					auto &key_type = element.children[0].type;
@@ -133,11 +148,19 @@ public:
 
 public:
 	LogicalType duckdb_type;
-	avro_type_t avro_type;
+	AvroKind kind = AvroKind::NULL_TYPE;
 	child_list_t<AvroType> children;
 	unordered_map<idx_t, optional_idx> union_child_map;
 	int32_t field_id = NumericLimits<int32_t>::Maximum();
-	bool is_timestamp_millis = false;
+	AvroTimeUnit unit = AvroTimeUnit::NONE;
+	idx_t fixed_size = 0;
 };
+
+struct AvroSchema {
+	AvroType type;
+	string root_name;
+};
+
+AvroSchema ParseAvroSchema(const string &json);
 
 } // namespace duckdb

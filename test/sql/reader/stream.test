@@ -1,0 +1,46 @@
+# name: test/sql/reader/stream.test
+# description: read_avro reads a gzip-compressed file as a stream of unknown size: to its end, also when the end is where a read of 1 MiB stops, rejects a block the stream ends inside, and serves a Top-N over it without lookups
+# group: [reader]
+
+require avro
+
+statement ok
+CREATE MACRO avro_long(n) AS from_hex(CASE
+	WHEN n < 64 THEN printf('%02x', 2 * n)
+	WHEN n < 8192 THEN printf('%02x%02x', 2 * n % 128 + 128, 2 * n // 128)
+	WHEN n < 1048576 THEN printf('%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384)
+	ELSE printf('%02x%02x%02x%02x', 2 * n % 128 + 128, 2 * n // 128 % 128 + 128, 2 * n // 16384 % 128 + 128, 2 * n // 2097152)
+END)
+
+statement ok
+COPY (SELECT content FROM read_blob('test/reader/parallel.avro')) TO '{TEST_DIR}/stream_parallel.avro.gz' (FORMAT BLOB)
+
+query IIII
+SELECT count(*), sum(id), count(opt), sum(len(nums)) FROM read_avro('{TEST_DIR}/stream_parallel.avro.gz')
+----
+300000	44999850000	200000	600000
+
+query I
+SELECT id FROM read_avro('{TEST_DIR}/stream_parallel.avro.gz') ORDER BY id DESC LIMIT 2
+----
+299999
+299998
+
+statement ok
+COPY (
+	SELECT header_data || '\x02'::BLOB || avro_long(octet_length(record_data)) || record_data || '\x5D\x4E\x1A\xC0\xFF\xEE\x7A\x1B\x2C\x3D\x4E\x5F\x60\x71\x82\x93'::BLOB
+	FROM (SELECT content AS header_data, '\x00'::BLOB || avro_long(1048552) || encode(repeat('a', 1048552)) AS record_data FROM read_blob('test/reader/header_only.avro'))
+) TO '{TEST_DIR}/stream_one_read.avro.gz' (FORMAT BLOB)
+
+query III
+SELECT count(*), sum(id), sum(length(word)) FROM read_avro('{TEST_DIR}/stream_one_read.avro.gz')
+----
+1	0	1048552
+
+statement ok
+COPY (SELECT from_hex(substr(hex(content), 1, 2 * (octet_length(content) - 100))) FROM read_blob('test/reader/big_block.avro')) TO '{TEST_DIR}/stream_truncated.avro.gz' (FORMAT BLOB)
+
+statement error
+SELECT count(*) FROM read_avro('{TEST_DIR}/stream_truncated.avro.gz')
+----
+<REGEX>:.*stream_truncated\.avro\.gz" is corrupt at the block at offset \d+: a block is truncated or does not end with the file's sync marker.*

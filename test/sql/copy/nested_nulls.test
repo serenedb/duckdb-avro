@@ -1,0 +1,62 @@
+# name: test/sql/copy/nested_nulls.test
+# description: NULLs at every level of lists, structs and maps round-trip through COPY ... TO (FORMAT AVRO)
+# group: [copy]
+
+require avro
+
+statement ok
+CREATE TABLE src (
+	id INTEGER,
+	l INTEGER[],
+	s STRUCT(a INTEGER, b VARCHAR[]),
+	ls STRUCT(c INTEGER, d INTEGER[])[],
+	m MAP(VARCHAR, INTEGER)
+);
+
+statement ok
+INSERT INTO src VALUES
+	(0, [1, NULL, 3], {'a': NULL, 'b': [NULL, 'x']}, [{'c': NULL, 'd': [NULL]}, NULL], MAP {'k1': NULL, 'k2': 5}),
+	(1, NULL, NULL, NULL, NULL),
+	(2, [], {'a': 1, 'b': []}, [], MAP {}),
+	(3, [NULL], {'a': 2, 'b': NULL}, [NULL, {'c': 4, 'd': NULL}], MAP {'k3': 7}),
+	(4, [NULL, NULL], NULL, [{'c': NULL, 'd': []}], NULL);
+
+statement ok
+COPY src TO '{TEST_DIR}/nested_nulls.avro' (FORMAT AVRO);
+
+query I
+SELECT count(*) FROM read_avro('{TEST_DIR}/nested_nulls.avro');
+----
+5
+
+query I
+SELECT count(*) FROM (SELECT * FROM src EXCEPT SELECT * FROM read_avro('{TEST_DIR}/nested_nulls.avro'));
+----
+0
+
+query IIIIIII
+SELECT id, l IS NULL, len(l), l[1], s.b[2], ls[2] IS NULL, cardinality(m)
+FROM read_avro('{TEST_DIR}/nested_nulls.avro') ORDER BY id;
+----
+0	false	3	1	x	true	2
+1	true	NULL	NULL	NULL	true	NULL
+2	false	0	NULL	NULL	true	0
+3	false	1	NULL	NULL	false	1
+4	false	2	NULL	NULL	true	NULL
+
+# The same rows spread over many chunks, with every chunk holding NULLs at another level.
+statement ok
+CREATE TABLE many AS SELECT id + 5 * i AS id, l, s, ls, m FROM src, range(2000) t(i);
+
+statement ok
+COPY many TO '{TEST_DIR}/nested_nulls_many.avro' (FORMAT AVRO);
+
+query I
+SELECT count(*) FROM (SELECT * FROM many EXCEPT SELECT * FROM read_avro('{TEST_DIR}/nested_nulls_many.avro'));
+----
+0
+
+query I
+SELECT count(*) FROM read_avro('{TEST_DIR}/nested_nulls_many.avro');
+----
+10000

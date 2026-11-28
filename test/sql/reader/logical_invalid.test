@@ -1,0 +1,21 @@
+# name: test/sql/reader/logical_invalid.test
+# description: read_avro reads a logical type on a type it cannot annotate, or with invalid parameters, as the underlying Avro type
+# group: [reader]
+
+require avro
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/reader/logical_invalid.avro'))
+----
+id	INTEGER
+date_on_string	VARCHAR
+timestamp_on_int	INTEGER
+decimal_scale_above_precision	BLOB
+uuid_on_fixed8	BLOB
+duration_on_fixed8	BLOB
+
+query IIIIII
+SELECT * FROM read_avro('test/reader/logical_invalid.avro') ORDER BY id
+----
+0	2024-01-01	86400	\x01\x02	\x00\x11\x223DUfw	\x01\x00\x00\x00\x02\x00\x00\x00
+1	not a date	-1	(empty)	abcdefgh	\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF

@@ -1,677 +1,1468 @@
+#include "avro_reader.hpp"
+
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/operator/multiply.hpp"
+#include "duckdb/common/types/decimal.hpp"
+#include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/vector/map_vector.hpp"
-#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
-#include "duckdb/common/vector/union_vector.hpp"
-#include "avro_reader.hpp"
-#include "utf8proc_wrapper.hpp"
-#include "duckdb/storage/external_file_cache/caching_file_system.hpp"
-#include "duckdb/common/file_system.hpp"
-#include "duckdb/common/multi_file/multi_file_data.hpp"
-#include "duckdb/common/types/uuid.hpp"
-#include "duckdb/common/types/interval.hpp"
-#include "duckdb/common/operator/multiply.hpp"
-#include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
-#include "duckdb/common/vector/map_vector.hpp"
 #include "duckdb/common/vector/union_vector.hpp"
+#include "duckdb/common/vector/vector_writer.hpp"
+#include "duckdb/execution/operator/csv_scanner/csv_file_handle.hpp"
+#include "duckdb/execution/operator/csv_scanner/csv_reader_options.hpp"
+#include "duckdb/formats/value_parsers.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
+#include "simdutf.h"
 
 namespace duckdb {
 
-static LogicalType AvroLogicalTypeToLogicalType(avro_schema_t &avro_schema) {
-	auto logical_type_raw = avro_schema_logical_type(avro_schema);
-	if (!logical_type_raw) {
-		return LogicalType::INVALID;
+namespace {
+
+constexpr idx_t HEADER_READ_BYTES = 64 * 1024;
+constexpr idx_t LOOKUP_BYTES = 64 * 1024;
+constexpr idx_t READ_BYTES = 1024 * 1024;
+constexpr idx_t MIN_RANGE_BYTES = 1024 * 1024;
+constexpr idx_t MAX_RANGE_BYTES = 8 * 1024 * 1024;
+constexpr idx_t RECORD_INDEX_BITS = 24;
+constexpr idx_t MAX_BLOCK_OFFSET = idx_t(1) << (63 - RECORD_INDEX_BITS);
+constexpr int64_t MAX_EMPTY_ITEMS = int64_t(1) << 32;
+
+[[noreturn]] void ThrowData(const char *detail) {
+	throw InvalidInputException(detail);
+}
+
+[[gnu::always_inline]] inline int64_t ReadLong(const char *&pos, const char *end) {
+	int64_t value;
+	if (!AvroReadLong(pos, value) || pos > end) {
+		ThrowData("a number is malformed or runs past the end of its block");
 	}
-	// any nested types are handled switch case in TransformSchema
-	switch (avro_typeof(avro_schema)) {
-	case AVRO_ARRAY:
-	case AVRO_ENUM:
-	case AVRO_MAP:
-	case AVRO_RECORD:
-		return LogicalType::INVALID;
+	return value;
+}
+
+[[gnu::always_inline]] inline void SkipLong(const char *&pos, const char *end) {
+	uint64_t skipped;
+	const auto size = EncodingUtil::TryDecodeUnsignedLEB128(const_data_ptr_cast(pos), AVRO_MAX_VARINT_SIZE, skipped);
+	if (size == 0) {
+		ThrowData("a number is malformed");
+	}
+	pos += size;
+	if (pos > end) {
+		ThrowData("a number runs past the end of its block");
+	}
+}
+
+inline int32_t ReadInt(const char *&pos, const char *end) {
+	const int64_t value = ReadLong(pos, end);
+	if (value < NumericLimits<int32_t>::Minimum() || value > NumericLimits<int32_t>::Maximum()) {
+		ThrowData("an int is out of range");
+	}
+	return static_cast<int32_t>(value);
+}
+
+inline idx_t ReadLength(const char *&pos, const char *end) {
+	const int64_t length = ReadLong(pos, end);
+	if (length < 0 || static_cast<idx_t>(length) > static_cast<idx_t>(end - pos)) {
+		ThrowData("a length is negative or runs past the end of its block");
+	}
+	return static_cast<idx_t>(length);
+}
+
+inline void Need(const char *pos, const char *end, idx_t bytes) {
+	if (bytes > static_cast<idx_t>(end - pos)) {
+		ThrowData("a value runs past the end of its block");
+	}
+}
+
+inline idx_t ReadBranch(const AvroNode &node, const char *&pos, const char *end) {
+	const int64_t branch = ReadLong(pos, end);
+	if (branch < 0 || static_cast<idx_t>(branch) >= node.children.size()) {
+		ThrowData("a union branch index is out of range");
+	}
+	return static_cast<idx_t>(branch);
+}
+
+[[gnu::always_inline]] inline int64_t TimeMicros(int64_t micros) {
+	if (micros < 0 || micros > Interval::MICROS_PER_DAY) {
+		ThrowData("a time value is outside of a day");
+	}
+	return micros;
+}
+
+[[gnu::always_inline]] inline void StringRef(const char *pos, idx_t length, const char *end, string_t &out) {
+	if (length > NumericLimits<uint32_t>::Maximum()) {
+		ThrowData("a string or bytes value is larger than 4 GiB");
+	}
+	MakeString(pos, length, end, out);
+}
+
+[[gnu::always_inline]] inline bool IsAscii(const char *data, idx_t size) {
+	uint64_t bits = 0;
+	idx_t i = 0;
+	for (; i + sizeof(uint64_t) <= size; i += sizeof(uint64_t)) {
+		uint64_t word;
+		memcpy(&word, data + i, sizeof(word));
+		bits |= word;
+	}
+	for (; i < size; i++) {
+		bits |= static_cast<uint8_t>(data[i]);
+	}
+	return (bits & 0x8080808080808080ULL) == 0;
+}
+
+[[gnu::always_inline]] inline void CheckUtf8(const char *pos, idx_t length) {
+	if (!IsAscii(pos, length) && !simdutf::validate_utf8(pos, length)) {
+		ThrowData("a string is not valid UTF-8");
+	}
+}
+
+bool CanBeEmpty(const AvroNode &node) {
+	switch (node.kind) {
+	case AvroKind::NULL_TYPE:
+		return true;
+	case AvroKind::FIXED:
+		return node.size == 0;
+	case AvroKind::RECORD:
+		for (auto &child : node.children) {
+			if (!CanBeEmpty(child)) {
+				return false;
+			}
+		}
+		return true;
 	default:
-		break;
+		return false;
 	}
-	string logical_type = logical_type_raw;
-	if (logical_type == "date") {
-		return LogicalType::DATE;
-	}
-	if (logical_type == "decimal") {
-		auto scale = avro_schema_scale(avro_schema);
-		auto precision = avro_schema_precision(avro_schema);
-		return LogicalType::DECIMAL(precision, scale);
-	}
-	if (logical_type == "time-micros") {
-		return LogicalType::TIME;
-	}
-	if (logical_type == "timestamp-micros") {
-		auto adjust_to_utc = avro_schema_adjust_to_utc(avro_schema);
-		// -1 doesn't exist
-		if (adjust_to_utc > 0) {
-			return LogicalType::TIMESTAMP_TZ;
-		}
-		return LogicalType::TIMESTAMP;
-	}
-	if (logical_type == "timestamp-nanos") {
-		auto adjust_to_utc = avro_schema_adjust_to_utc(avro_schema);
-		if (adjust_to_utc > 0) {
-			throw NotImplementedException("Avro timestamp-nanos with adjust_to_utc not supported");
-		}
-		return LogicalType::TIMESTAMP_NS;
-	}
-	if (logical_type == "uuid") {
-		auto size = avro_schema_fixed_size(avro_schema);
-		if (size != 16) {
-			throw InvalidConfigurationException("logical type is uuid, but size != 16");
-		}
-		return LogicalType::UUID;
-	}
-	if (logical_type == "time-millis") {
-		return LogicalType::TIME;
-	}
-	if (logical_type == "timestamp-millis") {
-		auto adjust_to_utc = avro_schema_adjust_to_utc(avro_schema);
-		if (adjust_to_utc > 0) {
-			return LogicalType::TIMESTAMP_TZ;
-		}
-		return LogicalType::TIMESTAMP;
-	}
-	if (logical_type == "local-timestamp-millis") {
-		return LogicalType::TIMESTAMP;
-	}
-	throw NotImplementedException("Unknown Avro logical type %s", logical_type);
 }
 
-static AvroType TransformSchema(avro_schema_t &avro_schema, unordered_set<string> parent_schema_names) {
-	auto duckdb_logical_type = AvroLogicalTypeToLogicalType(avro_schema);
-	bool has_logical_type = duckdb_logical_type != LogicalType::INVALID;
-
-	auto raw_lt = avro_schema_logical_type(avro_schema);
-	bool is_millis = raw_lt && (string(raw_lt) == "timestamp-millis" || string(raw_lt) == "time-millis" ||
-	                            string(raw_lt) == "local-timestamp-millis");
-
-	switch (avro_typeof(avro_schema)) {
-	case AVRO_NULL:
-		return AvroType(AVRO_NULL, LogicalType::SQLNULL);
-	case AVRO_BOOLEAN:
-		return AvroType(AVRO_BOOLEAN, LogicalType::BOOLEAN);
-	case AVRO_INT32: {
-		AvroType result(AVRO_INT32, has_logical_type ? duckdb_logical_type : LogicalType::INTEGER);
-		result.is_timestamp_millis = is_millis;
-		return result;
+idx_t ReadBlockCount(const AvroNode &item, const char *&pos, const char *end, idx_t &bytes) {
+	int64_t count = ReadLong(pos, end);
+	bytes = DConstants::INVALID_INDEX;
+	if (count < 0) {
+		if (count == NumericLimits<int64_t>::Minimum()) {
+			ThrowData("an array or map block count is out of range");
+		}
+		count = -count;
+		bytes = ReadLength(pos, end);
 	}
-	case AVRO_INT64: {
-		AvroType result(AVRO_INT64, has_logical_type ? duckdb_logical_type : LogicalType::BIGINT);
-		result.is_timestamp_millis = is_millis;
-		return result;
+	const bool empty_items = CanBeEmpty(item);
+	if ((!empty_items && count > end - pos) || (empty_items && count > MAX_EMPTY_ITEMS)) {
+		ThrowData("an array or map block count exceeds its data");
 	}
-	case AVRO_FLOAT:
-		return AvroType(AVRO_FLOAT, has_logical_type ? duckdb_logical_type : LogicalType::FLOAT);
-	case AVRO_DOUBLE:
-		return AvroType(AVRO_DOUBLE, has_logical_type ? duckdb_logical_type : LogicalType::DOUBLE);
-	case AVRO_BYTES:
-		return AvroType(AVRO_BYTES, has_logical_type ? duckdb_logical_type : LogicalType::BLOB);
-	case AVRO_STRING:
-		return AvroType(AVRO_STRING, has_logical_type ? duckdb_logical_type : LogicalType::VARCHAR);
-	case AVRO_UNION: {
-		auto num_children = avro_schema_union_size(avro_schema);
-		child_list_t<AvroType> union_children;
-		idx_t non_null_child_idx = 0;
-		unordered_map<idx_t, optional_idx> union_child_map;
-		for (idx_t child_idx = 0; child_idx < num_children; child_idx++) {
-			auto child_schema = avro_schema_union_branch(avro_schema, child_idx);
-			auto child_type = TransformSchema(child_schema, parent_schema_names);
-			union_children.emplace_back(
-			    std::pair<std::string, AvroType>(StringUtil::Format("u%llu", child_idx), std::move(child_type)));
-			if (child_type.duckdb_type.id() != LogicalTypeId::SQLNULL) {
-				union_child_map[child_idx] = non_null_child_idx++;
+	return static_cast<idx_t>(count);
+}
+
+void Skip(const AvroNode &node, const char *&pos, const char *end);
+
+void SkipBlocks(const AvroNode &node, const char *&pos, const char *end) {
+	while (true) {
+		idx_t bytes;
+		const idx_t count = ReadBlockCount(node.children[0], pos, end, bytes);
+		if (count == 0) {
+			return;
+		}
+		if (bytes != DConstants::INVALID_INDEX) {
+			pos += bytes;
+			continue;
+		}
+		for (idx_t i = 0; i < count; i++) {
+			if (node.kind == AvroKind::MAP) {
+				pos += ReadLength(pos, end);
 			}
+			Skip(node.children[0], pos, end);
 		}
-		return AvroType(AVRO_UNION, LogicalTypeId::UNION, std::move(union_children), union_child_map);
 	}
-	case AVRO_RECORD: {
-		auto schema_name = string(avro_schema_name(avro_schema));
-		if (parent_schema_names.find(schema_name) != parent_schema_names.end()) {
-			throw InvalidInputException("Recursive Avro types not supported: %s", schema_name);
-		}
-		parent_schema_names.insert(schema_name);
+}
 
-		auto num_children = avro_schema_record_size(avro_schema);
-		if (num_children == 0) {
-			// this we just ignore but we need a marker so we don't get our offsets
-			// wrong
-			return AvroType(AVRO_RECORD, LogicalTypeId::SQLNULL);
+void Skip(const AvroNode &node, const char *&pos, const char *end) {
+	switch (node.kind) {
+	case AvroKind::NULL_TYPE:
+		return;
+	case AvroKind::BOOLEAN:
+		Need(pos, end, 1);
+		pos++;
+		return;
+	case AvroKind::INT:
+	case AvroKind::LONG:
+	case AvroKind::ENUM:
+		ReadLong(pos, end);
+		return;
+	case AvroKind::FLOAT:
+		Need(pos, end, sizeof(float));
+		pos += sizeof(float);
+		return;
+	case AvroKind::DOUBLE:
+		Need(pos, end, sizeof(double));
+		pos += sizeof(double);
+		return;
+	case AvroKind::BYTES:
+	case AvroKind::STRING:
+		pos += ReadLength(pos, end);
+		return;
+	case AvroKind::FIXED:
+		Need(pos, end, node.size);
+		pos += node.size;
+		return;
+	case AvroKind::RECORD:
+		for (auto &child : node.children) {
+			Skip(child, pos, end);
 		}
-		child_list_t<AvroType> struct_children;
-		for (idx_t child_idx = 0; child_idx < num_children; child_idx++) {
-			auto child_schema = avro_schema_record_field_get_by_index(avro_schema, child_idx);
-			auto child_type = TransformSchema(child_schema, parent_schema_names);
-			child_type.field_id = avro_schema_record_field_id(avro_schema, child_idx);
-			auto child_name = avro_schema_record_field_name(avro_schema, child_idx);
-			if (!child_name || strlen(child_name) == 0) {
-				throw InvalidInputException("Empty avro field name");
-			}
+		return;
+	case AvroKind::ARRAY:
+	case AvroKind::MAP:
+		SkipBlocks(node, pos, end);
+		return;
+	case AvroKind::UNION:
+		Skip(node.children[ReadBranch(node, pos, end)], pos, end);
+		return;
+	}
+}
 
-			struct_children.emplace_back(std::pair<std::string, AvroType>(child_name, std::move(child_type)));
-		}
+void SetNull(Vector &target, idx_t row) {
+	FlatVector::SetNull(target, row, true);
+	if (target.GetType().InternalType() == PhysicalType::LIST) {
+		FlatVector::GetDataMutableUnsafe<list_entry_t>(target)[row] = list_entry_t(ListVector::GetListSize(target), 0);
+	}
+}
 
-		return AvroType(AVRO_RECORD, LogicalTypeId::STRUCT, std::move(struct_children));
+template <class T>
+void DecodeDecimal(const char *data, idx_t size, Vector &target, idx_t row) {
+	if (!Decimal::TryDecodeBigEndian(const_data_ptr_cast(data), size,
+	                                 FlatVector::GetDataMutableUnsafe<T>(target)[row])) {
+		ThrowData("a decimal value does not fit its precision");
 	}
-	case AVRO_ENUM: {
-		auto size = avro_schema_enum_number_of_symbols(avro_schema);
-		Vector levels(LogicalType::VARCHAR, size);
-		auto levels_data = FlatVector::GetDataMutable<string_t>(levels);
-		for (idx_t enum_idx = 0; enum_idx < static_cast<idx_t>(size); enum_idx++) {
-			levels_data[enum_idx] = StringVector::AddString(levels, avro_schema_enum_get(avro_schema, enum_idx));
-		}
-		levels.Verify();
-		return AvroType(AVRO_ENUM, LogicalType::ENUM(levels, size));
-	}
-	case AVRO_FIXED: {
-		return AvroType(AVRO_FIXED, has_logical_type ? duckdb_logical_type : LogicalType::BLOB);
-	}
-	case AVRO_ARRAY: {
-		auto child_schema = avro_schema_array_items(avro_schema);
-		auto element_id = avro_schema_array_element_id(avro_schema);
-		auto child_type = TransformSchema(child_schema, parent_schema_names);
-		child_type.field_id = element_id;
-		child_list_t<AvroType> list_children;
-		list_children.emplace_back(std::pair<std::string, AvroType>("list_entry", std::move(child_type)));
-		bool is_map = avro_schema_array_is_map(avro_schema);
-		if (is_map) {
-			return AvroType(AVRO_ARRAY, LogicalTypeId::MAP, std::move(list_children));
-		}
-		return AvroType(AVRO_ARRAY, LogicalTypeId::LIST, std::move(list_children));
-	}
-	case AVRO_MAP: {
-		auto child_schema = avro_schema_map_values(avro_schema);
-		auto key_id = avro_schema_map_key_id(avro_schema);
-		auto value_id = avro_schema_map_value_id(avro_schema);
+}
 
-		AvroType key_type(AVRO_STRING, LogicalTypeId::VARCHAR);
-		key_type.field_id = key_id;
-		auto value_type = TransformSchema(child_schema, parent_schema_names);
-		value_type.field_id = value_id;
-
-		child_list_t<AvroType> map_children;
-		map_children.emplace_back(std::pair<std::string, AvroType>("key_entry", std::move(key_type)));
-		map_children.emplace_back(std::pair<std::string, AvroType>("value_entry", std::move(value_type)));
-		return AvroType(AVRO_MAP, LogicalTypeId::MAP, std::move(map_children));
-	}
-	case AVRO_LINK: {
-		auto target = avro_schema_link_target(avro_schema);
-		return TransformSchema(target, parent_schema_names);
-	}
+void DecodeDecimal(const AvroNode &node, const char *data, idx_t size, Vector &target, idx_t row) {
+	switch (node.physical) {
+	case PhysicalType::INT16:
+		DecodeDecimal<int16_t>(data, size, target, row);
+		return;
+	case PhysicalType::INT32:
+		DecodeDecimal<int32_t>(data, size, target, row);
+		return;
+	case PhysicalType::INT64:
+		DecodeDecimal<int64_t>(data, size, target, row);
+		return;
 	default:
-		throw NotImplementedException("Unknown Avro Type %s", avro_schema_type_name(avro_schema));
+		DecodeDecimal<hugeint_t>(data, size, target, row);
+		return;
 	}
 }
 
-struct AvroSchemaDecref {
-	void operator()(avro_schema_t schema) const {
-		avro_schema_decref(schema);
+void Decode(const AvroNode &node, const char *&pos, const char *end, Vector &target, idx_t row);
+
+void DecodeArray(const AvroNode &node, const char *&pos, const char *end, Vector &target, idx_t row) {
+	const idx_t offset = ListVector::GetListSize(target);
+	idx_t total = 0;
+	while (true) {
+		idx_t bytes;
+		const idx_t count = ReadBlockCount(node.children[0], pos, end, bytes);
+		if (count == 0) {
+			break;
+		}
+		ListVector::Reserve(target, offset + total + count);
+		auto &child = ListVector::GetChildMutable(target);
+		for (idx_t i = 0; i < count; i++) {
+			Decode(node.children[0], pos, end, child, offset + total + i);
+		}
+		total += count;
 	}
-};
+	FlatVector::GetDataMutableUnsafe<list_entry_t>(target)[row] = list_entry_t(offset, total);
+	ListVector::SetListSize(target, offset + total);
+}
 
-AvroReader::AvroReader(ClientContext &context, OpenFileInfo file, const AvroFileReaderOptions &options)
-    : BaseFileReader(file) {
-	auto &fs = FileSystem::GetFileSystem(context);
-
-	FileOpenFlags flags = FileFlags::FILE_FLAGS_READ;
-	flags.SetCachingMode(CachingMode::ALWAYS_CACHE);
-	auto file_handle = fs.OpenFile(this->file, flags);
-	auto total_size = file_handle->GetFileSize();
-
-	local_buffer = Allocator::DefaultAllocator().Allocate(total_size);
-	fs.Read(*file_handle, local_buffer.get(), total_size);
-
-	avro_file_reader_t opened;
-	if (avro_file_reader_memory(const_char_ptr_cast(local_buffer.get()), total_size, &opened)) {
-		throw InvalidInputException(avro_strerror());
+void CheckMapKeys(const Vector &target, idx_t row) {
+	auto &validity = FlatVector::Validity(MapVector::GetKeys(target));
+	if (validity.AllValid()) {
+		return;
 	}
-	reader.reset(opened);
-	size_t file_block_count;
-	if (avro_file_reader_get_block_count(reader.get(), &file_block_count)) {
-		throw InvalidInputException(avro_strerror());
-	}
-	block_count = file_block_count;
-
-	const unique_ptr<std::remove_pointer_t<avro_schema_t>, AvroSchemaDecref> schema_owner(
-	    avro_file_reader_get_writer_schema(reader.get()));
-	avro_schema_t avro_schema = schema_owner.get();
-	auto schema_name = avro_schema_name(avro_schema);
-	string root_name = schema_name ? schema_name : "avro_schema";
-
-	avro_type = TransformSchema(avro_schema, {});
-	auto root = AvroType::TransformAvroType(root_name, avro_type);
-	duckdb_type = root.type;
-	value_iface.reset(avro_generic_class_from_schema(avro_schema));
-	if (!value_iface) {
-		throw InvalidInputException(avro_strerror());
-	}
-
-	// special handling for root structs, we pull up the entries
-	if (duckdb_type.id() == LogicalTypeId::STRUCT) {
-		columns = std::move(root.children);
-	} else {
-		columns.clear();
-		columns.push_back(std::move(root));
+	const auto entry = FlatVector::GetData<list_entry_t>(target)[row];
+	for (idx_t i = entry.offset; i < entry.offset + entry.length; i++) {
+		if (!validity.RowIsValid(i)) {
+			ThrowData("a map key is NULL");
+		}
 	}
 }
 
-AvroReaderScanState::AvroReaderScanState(ClientContext &context, AvroReader &reader_p) : reader(reader_p) {
-	read_chunk.Initialize(context, {reader.duckdb_type}, STANDARD_VECTOR_SIZE);
-	if (avro_file_block_reader_create(reader.reader.get(), &block_reader)) {
-		throw InvalidInputException(avro_strerror());
+void DecodeMap(const AvroNode &node, const char *&pos, const char *end, Vector &target, idx_t row) {
+	const idx_t offset = ListVector::GetListSize(target);
+	idx_t total = 0;
+	while (true) {
+		idx_t bytes;
+		const idx_t count = ReadBlockCount(node.children[0], pos, end, bytes);
+		if (count == 0) {
+			break;
+		}
+		ListVector::Reserve(target, offset + total + count);
+		auto &keys = MapVector::GetKeys(target);
+		auto &values = MapVector::GetValues(target);
+		auto key_data = FlatVector::GetDataMutableUnsafe<string_t>(keys);
+		for (idx_t i = 0; i < count; i++) {
+			const idx_t length = ReadLength(pos, end);
+			CheckUtf8(pos, length);
+			StringRef(pos, length, end, key_data[offset + total + i]);
+			pos += length;
+			Decode(node.children[0], pos, end, values, offset + total + i);
+		}
+		total += count;
 	}
-	if (avro_generic_value_new(reader.value_iface.get(), &value)) {
-		avro_file_block_reader_close(block_reader);
-		block_reader = nullptr;
-		throw InvalidInputException(avro_strerror());
-	}
+	FlatVector::GetDataMutableUnsafe<list_entry_t>(target)[row] = list_entry_t(offset, total);
+	ListVector::SetListSize(target, offset + total);
 }
 
-AvroReaderScanState::~AvroReaderScanState() {
-	avro_value_decref(&value);
-	avro_file_block_reader_close(block_reader);
+void DecodeUnion(const AvroNode &node, const char *&pos, const char *end, Vector &target, idx_t row) {
+	const idx_t branch = ReadBranch(node, pos, end);
+	const idx_t member = node.members[branch];
+	if (member == DConstants::INVALID_INDEX) {
+		Skip(node.children[branch], pos, end);
+		SetNull(target, row);
+		return;
+	}
+	if (node.decode == AvroDecode::NULLABLE) {
+		Decode(node.children[branch], pos, end, target, row);
+		return;
+	}
+	FlatVector::GetDataMutableUnsafe<union_tag_t>(UnionVector::GetTags(target))[row] = static_cast<union_tag_t>(member);
+	const idx_t member_count = UnionType::GetMemberCount(target.GetType());
+	for (idx_t i = 0; i < member_count; i++) {
+		if (i != member) {
+			SetNull(UnionVector::GetMember(target, i), row);
+		}
+	}
+	Decode(node.children[branch], pos, end, UnionVector::GetMember(target, member), row);
 }
 
-void AvroReaderScanState::SelectBlock(idx_t block_index) {
-	avro_value_reset(&value);
-	if (avro_file_block_reader_select_block(block_reader, block_index)) {
-		throw InvalidInputException(avro_strerror());
+void Decode(const AvroNode &node, const char *&pos, const char *end, Vector &target, idx_t row) {
+	switch (node.decode) {
+	case AvroDecode::NULL_VALUE:
+	case AvroDecode::EMPTY_RECORD:
+		SetNull(target, row);
+		return;
+	case AvroDecode::BOOLEAN:
+		Need(pos, end, 1);
+		FlatVector::GetDataMutableUnsafe<bool>(target)[row] = *pos != 0;
+		pos++;
+		return;
+	case AvroDecode::INT:
+	case AvroDecode::DATE:
+		FlatVector::GetDataMutableUnsafe<int32_t>(target)[row] = ReadInt(pos, end);
+		return;
+	case AvroDecode::TIME_MILLIS:
+		FlatVector::GetDataMutableUnsafe<int64_t>(target)[row] =
+		    TimeMicros(static_cast<int64_t>(ReadInt(pos, end)) * Interval::MICROS_PER_MSEC);
+		return;
+	case AvroDecode::TIME_MICROS:
+		FlatVector::GetDataMutableUnsafe<int64_t>(target)[row] = TimeMicros(ReadLong(pos, end));
+		return;
+	case AvroDecode::LONG:
+		FlatVector::GetDataMutableUnsafe<int64_t>(target)[row] = ReadLong(pos, end);
+		return;
+	case AvroDecode::TIMESTAMP_MILLIS: {
+		int64_t micros;
+		if (!TryMultiplyOperator::Operation<int64_t, int64_t, int64_t>(ReadLong(pos, end), Interval::MICROS_PER_MSEC,
+		                                                               micros)) {
+			ThrowData("a timestamp-millis value is out of range");
+		}
+		FlatVector::GetDataMutableUnsafe<int64_t>(target)[row] = micros;
+		return;
 	}
-}
-
-static void TransformValue(avro_value *avro_val, const AvroType &avro_type, Vector &target, idx_t out_idx) {
-
-	switch (avro_type.duckdb_type.id()) {
-	case LogicalTypeId::SQLNULL: {
-		FlatVector::SetNull(target, out_idx, true);
-		break;
+	case AvroDecode::FLOAT:
+		Need(pos, end, sizeof(float));
+		memcpy(FlatVector::GetDataMutableUnsafe<float>(target) + row, pos, sizeof(float));
+		pos += sizeof(float);
+		return;
+	case AvroDecode::DOUBLE:
+		Need(pos, end, sizeof(double));
+		memcpy(FlatVector::GetDataMutableUnsafe<double>(target) + row, pos, sizeof(double));
+		pos += sizeof(double);
+		return;
+	case AvroDecode::STRING: {
+		const idx_t length = ReadLength(pos, end);
+		CheckUtf8(pos, length);
+		StringRef(pos, length, end, FlatVector::GetDataMutableUnsafe<string_t>(target)[row]);
+		pos += length;
+		return;
 	}
-	case LogicalTypeId::BOOLEAN: {
-		int bool_val;
-		if (avro_value_get_boolean(avro_val, &bool_val)) {
-			throw InvalidInputException(avro_strerror());
+	case AvroDecode::UUID_STRING: {
+		const idx_t length = ReadLength(pos, end);
+		hugeint_t value;
+		if (!BaseUUID::FromString(std::string_view(pos, length), value, true)) {
+			ThrowData("a uuid string is not a valid UUID");
 		}
-		FlatVector::GetDataMutable<uint8_t>(target)[out_idx] = bool_val != 0;
-		break;
+		FlatVector::GetDataMutableUnsafe<hugeint_t>(target)[row] = value;
+		pos += length;
+		return;
 	}
-	case LogicalTypeId::DATE:
-	case LogicalTypeId::INTEGER: {
-		if (avro_value_get_int(avro_val, &FlatVector::GetDataMutable<int32_t>(target)[out_idx])) {
-			throw InvalidInputException(avro_strerror());
-		}
-		break;
+	case AvroDecode::BYTES: {
+		const idx_t length = ReadLength(pos, end);
+		StringRef(pos, length, end, FlatVector::GetDataMutableUnsafe<string_t>(target)[row]);
+		pos += length;
+		return;
 	}
-	case LogicalTypeId::TIME: {
-		int64_t result;
-		if (avro_type.is_timestamp_millis) {
-			// time-millis: stored as int32 (ms since midnight), scale to µs
-			int32_t raw_val;
-			if (avro_value_get_int(avro_val, &raw_val)) {
-				throw InvalidInputException(avro_strerror());
-			}
-			// no thread of overflow since raw value is int32_t
-			result = static_cast<int64_t>(raw_val) * Interval::MICROS_PER_MSEC;
-		} else {
-			if (avro_value_get_long(avro_val, &result)) {
-				throw InvalidInputException(avro_strerror());
-			}
-		}
-		FlatVector::GetDataMutable<int64_t>(target)[out_idx] = result;
-		break;
+	case AvroDecode::DECIMAL_BYTES: {
+		const idx_t length = ReadLength(pos, end);
+		DecodeDecimal(node, pos, length, target, row);
+		pos += length;
+		return;
 	}
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_TZ:
-	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::BIGINT: {
-		int64_t raw_val;
-		if (avro_value_get_long(avro_val, &raw_val)) {
-			throw InvalidInputException(avro_strerror());
+	case AvroDecode::FIXED:
+		Need(pos, end, node.size);
+		StringRef(pos, node.size, end, FlatVector::GetDataMutableUnsafe<string_t>(target)[row]);
+		pos += node.size;
+		return;
+	case AvroDecode::UUID_FIXED:
+		Need(pos, end, node.size);
+		FlatVector::GetDataMutableUnsafe<hugeint_t>(target)[row] = BaseUUID::FromBlob(const_data_ptr_cast(pos));
+		pos += node.size;
+		return;
+	case AvroDecode::DECIMAL_FIXED:
+		Need(pos, end, node.size);
+		DecodeDecimal(node, pos, node.size, target, row);
+		pos += node.size;
+		return;
+	case AvroDecode::DURATION: {
+		Need(pos, end, node.size);
+		const uint32_t months = LoadLE<uint32_t>(const_data_ptr_cast(pos));
+		const uint32_t days = LoadLE<uint32_t>(const_data_ptr_cast(pos + 4));
+		const uint32_t millis = LoadLE<uint32_t>(const_data_ptr_cast(pos + 8));
+		if (months > static_cast<uint32_t>(NumericLimits<int32_t>::Maximum()) ||
+		    days > static_cast<uint32_t>(NumericLimits<int32_t>::Maximum())) {
+			ThrowData("a duration is out of range");
 		}
-		FlatVector::GetDataMutable<int64_t>(target)[out_idx] =
-		    avro_type.is_timestamp_millis ? MultiplyOperatorOverflowCheck::Operation<int64_t, int64_t, int64_t>(
-		                                        raw_val, Interval::MICROS_PER_MSEC)
-		                                  : raw_val;
-		break;
+		interval_t value;
+		value.months = static_cast<int32_t>(months);
+		value.days = static_cast<int32_t>(days);
+		value.micros = static_cast<int64_t>(millis) * Interval::MICROS_PER_MSEC;
+		FlatVector::GetDataMutableUnsafe<interval_t>(target)[row] = value;
+		pos += node.size;
+		return;
 	}
-	case LogicalTypeId::FLOAT: {
-		if (avro_value_get_float(avro_val, &FlatVector::GetDataMutable<float>(target)[out_idx])) {
-			throw InvalidInputException(avro_strerror());
+	case AvroDecode::ENUM: {
+		const int64_t index = ReadLong(pos, end);
+		if (index < 0 || static_cast<idx_t>(index) >= node.size) {
+			ThrowData("an enum index is out of range");
 		}
-		break;
-	}
-	case LogicalTypeId::DOUBLE: {
-		if (avro_value_get_double(avro_val, &FlatVector::GetDataMutable<double>(target)[out_idx])) {
-			throw InvalidInputException(avro_strerror());
-		}
-		break;
-	}
-	case LogicalTypeId::UUID: {
-		size_t fixed_size = 16;
-		const void *fixed_data;
-		if (avro_value_get_fixed(avro_val, &fixed_data, &fixed_size)) {
-			throw InvalidInputException(avro_strerror());
-		}
-		FlatVector::GetDataMutable<hugeint_t>(target)[out_idx] = BaseUUID::FromBlob(const_data_ptr_cast(fixed_data));
-		break;
-	}
-	case LogicalTypeId::DECIMAL: {
-		// decimals should never be more than 16
-		const uint8_t bytes_data[16] = {};
-		const void *ptr = bytes_data;
-		size_t bytes_size;
-		avro_wrapped_buffer bytes_buf = AVRO_WRAPPED_BUFFER_EMPTY;
-
-		if (avro_type.avro_type == AVRO_BYTES) {
-			if (avro_value_grab_bytes(avro_val, &bytes_buf)) {
-				throw InvalidInputException(avro_strerror());
-			}
-			ptr = bytes_buf.buf;
-			bytes_size = bytes_buf.size;
-		} else { // AVRO_FIXED
-			if (avro_value_get_fixed(avro_val, &ptr, &bytes_size)) {
-				throw InvalidInputException(avro_strerror());
-			}
-		}
-
-		auto raw = const_data_ptr_cast(ptr);
-		// Sign bit is in the MSB of the first byte
-		bool negative = bytes_size > 0 && (raw[0] & 0x80);
-
-		switch (avro_type.duckdb_type.InternalType()) {
-		case PhysicalType::INT16: {
-			uint16_t result = negative ? 0xFFFF : 0;
-			for (idx_t i = 0; i < bytes_size; i++) {
-				result = (result << 8) | raw[i];
-			}
-			FlatVector::GetDataMutable<int16_t>(target)[out_idx] = (int16_t)result;
-			break;
-		}
-		case PhysicalType::INT32: {
-			uint32_t result = negative ? 0xFFFFFFFF : 0;
-			for (idx_t i = 0; i < bytes_size; i++) {
-				result = (result << 8) | raw[i];
-			}
-			FlatVector::GetDataMutable<int32_t>(target)[out_idx] = (int32_t)result;
-			break;
-		}
-		case PhysicalType::INT64: {
-			uint64_t result = negative ? ~0ULL : 0;
-			for (idx_t i = 0; i < bytes_size; i++) {
-				result = (result << 8) | raw[i];
-			}
-			FlatVector::GetDataMutable<int64_t>(target)[out_idx] = (int64_t)result;
-			break;
-		}
-		case PhysicalType::INT128: {
-			int64_t upper_val = 0;
-			uint64_t lower_val = 0;
-
-			// Calculate how many bytes go into upper and lower parts
-			idx_t upper_bytes;
-			if (bytes_size == 8) {
-				int64_t lower_val_signed = 0;
-				for (idx_t i = 0; i < bytes_size; i++) {
-					int64_t raw_byte = raw[i];
-					lower_val_signed |= (raw_byte << ((7 - i) * 8));
-				}
-				upper_bytes = 0;
-				auto ret = hugeint_t(lower_val_signed);
-				FlatVector::GetDataMutable<hugeint_t>(target)[out_idx] = ret;
-				break;
-			} else {
-				upper_bytes = (bytes_size <= sizeof(uint64_t)) ? bytes_size : (bytes_size - sizeof(uint64_t));
-			}
-
-			// Read upper part (big-endian)
-			// TODO: upper part might be sign extended bti.
-			for (idx_t i = 0; i < upper_bytes; i++) {
-				upper_val = (upper_val << 8) | raw[i];
-			}
-
-			// Handle sign extension for negative numbers
-			if (bytes_size > 0 && (raw[0] & 0x80)) {
-				// Fill remaining bytes with 1s for negative numbers
-				if (upper_bytes < sizeof(int64_t)) {
-					// Create a mask with 1s in the upper bits that need to be filled
-					int64_t mask = ((int64_t)1 << ((sizeof(int64_t) - upper_bytes) * 8)) - 1;
-					mask = mask << (upper_bytes * 8);
-					upper_val |= mask;
-				}
-			}
-
-			// Read lower part if there are remaining bytes
-			if (bytes_size > sizeof(int64_t)) {
-				for (idx_t i = upper_bytes; i < bytes_size; i++) {
-					lower_val = (lower_val << 8) | raw[i];
-				}
-			}
-
-			auto ret = hugeint_t(upper_val, lower_val);
-			FlatVector::GetDataMutable<hugeint_t>(target)[out_idx] = ret;
-			break;
-		}
-		default:
-			throw NotImplementedException("Unsupported decimal physical type");
-		}
-
-		if (avro_type.avro_type == AVRO_BYTES) {
-			bytes_buf.free(&bytes_buf);
-		}
-		break;
-	}
-	case LogicalTypeId::BLOB:
-		switch (avro_type.avro_type) {
-		case AVRO_FIXED: {
-			size_t fixed_size;
-			const void *fixed_data;
-			if (avro_value_get_fixed(avro_val, &fixed_data, &fixed_size)) {
-				throw InvalidInputException(avro_strerror());
-			}
-			FlatVector::GetDataMutable<string_t>(target)[out_idx] =
-			    StringVector::AddStringOrBlob(target, const_char_ptr_cast(fixed_data), fixed_size);
-			break;
-		}
-		case AVRO_BYTES: {
-			avro_wrapped_buffer blob_buf = AVRO_WRAPPED_BUFFER_EMPTY;
-			if (avro_value_grab_bytes(avro_val, &blob_buf)) {
-				throw InvalidInputException(avro_strerror());
-			}
-			FlatVector::GetDataMutable<string_t>(target)[out_idx] =
-			    StringVector::AddStringOrBlob(target, const_char_ptr_cast(blob_buf.buf), blob_buf.size);
-			blob_buf.free(&blob_buf);
-			break;
-		}
-		default:
-			throw NotImplementedException("Unknown Avro blob type %s");
-		}
-		break;
-
-	case LogicalTypeId::VARCHAR: {
-		avro_wrapped_buffer str_buf = AVRO_WRAPPED_BUFFER_EMPTY;
-		if (avro_value_grab_string(avro_val, &str_buf)) {
-			throw InvalidInputException(avro_strerror());
-		}
-		// avro strings are null-terminated
-		D_ASSERT(const_char_ptr_cast(str_buf.buf)[str_buf.size - 1] == '\0');
-		if (!Utf8Proc::IsValid(const_char_ptr_cast(str_buf.buf), str_buf.size - 1)) {
-			throw InvalidInputException("Avro file contains invalid unicode string");
-		}
-		FlatVector::GetDataMutable<string_t>(target)[out_idx] =
-		    StringVector::AddString(target, const_char_ptr_cast(str_buf.buf), str_buf.size - 1);
-		str_buf.free(&str_buf);
-		break;
-	}
-	case LogicalTypeId::STRUCT: {
-		size_t child_count;
-		if (avro_value_get_size(avro_val, &child_count)) {
-			throw InvalidInputException(avro_strerror());
-		}
-		D_ASSERT(child_count == StructType::GetChildCount(target.GetType()));
-		D_ASSERT(child_count == avro_type.children.size());
-
-		for (idx_t child_idx = 0; child_idx < child_count; child_idx++) {
-			avro_value child_value;
-			if (avro_value_get_by_index(avro_val, child_idx, &child_value, nullptr)) {
-				throw InvalidInputException(avro_strerror());
-			}
-			TransformValue(&child_value, avro_type.children[child_idx].second,
-			               StructVector::GetEntries(target)[child_idx], out_idx);
-		}
-		break;
-	}
-
-	case LogicalTypeId::UNION: {
-		int discriminant = 0;
-		avro_value union_value;
-		if (avro_value_get_discriminant(avro_val, &discriminant) ||
-		    avro_value_get_current_branch(avro_val, &union_value)) {
-			throw InvalidInputException(avro_strerror());
-		}
-		if (static_cast<size_t>(discriminant) >= avro_type.children.size()) {
-			throw InvalidInputException("Invalid union tag");
-		}
-
-		if (avro_type.children[discriminant].second.duckdb_type == LogicalTypeId::SQLNULL) {
-			FlatVector::SetNull(target, out_idx, true);
-			break;
-		}
-
-		if (target.GetType().id() == LogicalTypeId::UNION) {
-			auto duckdb_child_index = avro_type.union_child_map.at(discriminant).GetIndex();
-			auto &tags = UnionVector::GetTags(target);
-			FlatVector::GetDataMutable<union_tag_t>(tags)[out_idx] = duckdb_child_index;
-			auto &union_vector = UnionVector::GetMember(target, duckdb_child_index);
-
-			// orrrrrrrrrrrrr
-			for (idx_t child_idx = 1; child_idx < StructVector::GetEntries(target).size(); child_idx++) {
-				if (child_idx != duckdb_child_index + 1) { // duckdb child index is bigger because of the tag
-					FlatVector::SetNull(StructVector::GetEntries(target)[child_idx], out_idx, true);
-				}
-			}
-
-			TransformValue(&union_value, avro_type.children[discriminant].second, union_vector, out_idx);
-		} else { // directly recurse, we have dissolved the union
-			TransformValue(&union_value, avro_type.children[discriminant].second, target, out_idx);
-		}
-
-		break;
-	}
-	case LogicalTypeId::ENUM: {
-		auto enum_type = EnumType::GetPhysicalType(target.GetType());
-		int enum_val;
-
-		if (avro_value_get_enum(avro_val, &enum_val)) {
-			throw InvalidInputException(avro_strerror());
-		}
-		if (enum_val < 0 || static_cast<idx_t>(enum_val) >= EnumType::GetSize(target.GetType())) {
-			throw InvalidInputException("Enum value out of range");
-		}
-
-		switch (enum_type) {
+		switch (node.physical) {
 		case PhysicalType::UINT8:
-			FlatVector::GetDataMutable<uint8_t>(target)[out_idx] = enum_val;
-			break;
+			FlatVector::GetDataMutableUnsafe<uint8_t>(target)[row] = static_cast<uint8_t>(index);
+			return;
 		case PhysicalType::UINT16:
-			FlatVector::GetDataMutable<uint16_t>(target)[out_idx] = enum_val;
-			break;
-		case PhysicalType::UINT32:
-			FlatVector::GetDataMutable<uint32_t>(target)[out_idx] = enum_val;
-			break;
+			FlatVector::GetDataMutableUnsafe<uint16_t>(target)[row] = static_cast<uint16_t>(index);
+			return;
 		default:
-			throw InternalException("Unsupported Enum Internal Type");
+			FlatVector::GetDataMutableUnsafe<uint32_t>(target)[row] = static_cast<uint32_t>(index);
+			return;
 		}
-		break;
 	}
-
-	case LogicalTypeId::MAP:
-	case LogicalTypeId::LIST: {
-		size_t list_len;
-		if (avro_value_get_size(avro_val, &list_len)) {
-			throw InvalidInputException(avro_strerror());
+	case AvroDecode::RECORD: {
+		auto &entries = StructVector::GetEntries(target);
+		for (idx_t i = 0; i < node.children.size(); i++) {
+			Decode(node.children[i], pos, end, entries[i], row);
 		}
-
-		auto child_offset = ListVector::GetListSize(target);
-		ListVector::Reserve(target, child_offset + list_len);
-
-		if (avro_type.avro_type == AVRO_ARRAY) {
-			auto &child_vector = ListVector::GetChildMutable(target);
-
-			for (idx_t child_idx = 0; child_idx < list_len; child_idx++) {
-				avro_value_t child_value;
-				if (avro_value_get_by_index(avro_val, child_idx, &child_value, nullptr)) {
-					throw InvalidInputException(avro_strerror());
-				}
-				TransformValue(&child_value, avro_type.children[0].second, child_vector, child_offset + child_idx);
-			}
-		} else {
-			auto &key_vector = MapVector::GetKeys(target);
-			auto &value_vector = MapVector::GetValues(target);
-
-			auto &key_type = avro_type.children[0].second;
-			//! Unused, always VARCHAR
-			(void)key_type;
-			auto &value_type = avro_type.children[1].second;
-			D_ASSERT(key_vector.GetType().id() == LogicalTypeId::VARCHAR);
-			auto string_ptr = FlatVector::GetDataMutable<string_t>(key_vector);
-			for (idx_t entry_idx = 0; entry_idx < list_len; entry_idx++) {
-				avro_value child_value;
-				const char *map_key;
-				if (avro_value_get_by_index(avro_val, entry_idx, &child_value, &map_key)) {
-					throw InvalidInputException(avro_strerror());
-				}
-				D_ASSERT(map_key);
-				string_ptr[child_offset + entry_idx] = StringVector::AddString(key_vector, map_key);
-				TransformValue(&child_value, value_type, value_vector, child_offset + entry_idx);
-			}
-		}
-		auto list_vector_data = FlatVector::GetDataMutable<list_entry_t>(target);
-		list_vector_data[out_idx].length = list_len;
-		list_vector_data[out_idx].offset = child_offset;
-		ListVector::SetListSize(target, child_offset + list_len);
-		break;
+		return;
 	}
-
-	default:
-		throw NotImplementedException(avro_type.duckdb_type.ToString());
+	case AvroDecode::ARRAY:
+		DecodeArray(node, pos, end, target, row);
+		return;
+	case AvroDecode::ARRAY_MAP:
+		DecodeArray(node, pos, end, target, row);
+		CheckMapKeys(target, row);
+		return;
+	case AvroDecode::MAP:
+		DecodeMap(node, pos, end, target, row);
+		return;
+	case AvroDecode::UNION:
+	case AvroDecode::NULLABLE:
+		DecodeUnion(node, pos, end, target, row);
+		return;
 	}
 }
 
-void AvroReader::Read(AvroReaderScanState &scan_state, DataChunk &output) {
-	idx_t out_idx = 0;
-	scan_state.read_chunk.Reset();
+template <class T>
+[[gnu::always_inline]] inline void Store(const AvroTarget &target, idx_t row, T value) {
+	reinterpret_cast<T *>(target.data)[row] = value;
+}
 
-	D_ASSERT(scan_state.read_chunk.ColumnCount() == 1);
-	auto &read_vec = scan_state.read_chunk.data[0];
-	int ret = 0;
-	while ((ret = avro_file_block_reader_read_value(scan_state.block_reader, &scan_state.value)) == 0) {
-		TransformValue(&scan_state.value, avro_type, read_vec, out_idx++);
-		if (out_idx == STANDARD_VECTOR_SIZE) {
+[[gnu::always_inline]] inline bool FastBranch(const AvroNode &node, const char *&pos, const char *end,
+                                              const AvroTarget &target, idx_t row) {
+	if (node.decode != AvroDecode::NULLABLE) {
+		return true;
+	}
+	Need(pos, end, 1);
+	const auto branch = static_cast<uint8_t>(*pos);
+	if (branch == node.null_byte) {
+		pos++;
+		target.validity->SetInvalid(row);
+		return false;
+	}
+	if (branch != node.value_byte) {
+		Decode(node, pos, end, *target.vector, row);
+		return false;
+	}
+	pos++;
+	return true;
+}
+
+[[gnu::always_inline]] inline void DecodeFast(const AvroNode &node, const char *&pos, const char *end,
+                                              const AvroTarget &target, idx_t row) {
+	if (!FastBranch(node, pos, end, target, row)) {
+		return;
+	}
+	switch (node.fast) {
+	case AvroFast::BOOLEAN:
+		Need(pos, end, 1);
+		Store<bool>(target, row, *pos != 0);
+		pos++;
+		return;
+	case AvroFast::INT:
+		Store<int32_t>(target, row, ReadInt(pos, end));
+		return;
+	case AvroFast::TIME_MILLIS:
+		Store<int64_t>(target, row, TimeMicros(static_cast<int64_t>(ReadInt(pos, end)) * Interval::MICROS_PER_MSEC));
+		return;
+	case AvroFast::TIME_MICROS:
+		Store<int64_t>(target, row, TimeMicros(ReadLong(pos, end)));
+		return;
+	case AvroFast::LONG:
+		Store<int64_t>(target, row, ReadLong(pos, end));
+		return;
+	case AvroFast::TIMESTAMP_MILLIS: {
+		int64_t micros;
+		if (!TryMultiplyOperator::Operation<int64_t, int64_t, int64_t>(ReadLong(pos, end), Interval::MICROS_PER_MSEC,
+		                                                               micros)) {
+			ThrowData("a timestamp-millis value is out of range");
+		}
+		Store<int64_t>(target, row, micros);
+		return;
+	}
+	case AvroFast::FLOAT:
+		Need(pos, end, sizeof(float));
+		memcpy(target.data + row * sizeof(float), pos, sizeof(float));
+		pos += sizeof(float);
+		return;
+	case AvroFast::DOUBLE:
+		Need(pos, end, sizeof(double));
+		memcpy(target.data + row * sizeof(double), pos, sizeof(double));
+		pos += sizeof(double);
+		return;
+	case AvroFast::STRING: {
+		const idx_t length = ReadLength(pos, end);
+		CheckUtf8(pos, length);
+		StringRef(pos, length, end, reinterpret_cast<string_t *>(target.data)[row]);
+		pos += length;
+		return;
+	}
+	case AvroFast::BYTES: {
+		const idx_t length = ReadLength(pos, end);
+		StringRef(pos, length, end, reinterpret_cast<string_t *>(target.data)[row]);
+		pos += length;
+		return;
+	}
+	case AvroFast::NONE:
+		break;
+	}
+	Decode(node, pos, end, *target.vector, row);
+}
+
+[[gnu::always_inline]] inline void SkipFast(const AvroNode &node, const char *&pos, const char *end) {
+	if (node.decode == AvroDecode::NULLABLE) {
+		Need(pos, end, 1);
+		const auto branch = static_cast<uint8_t>(*pos);
+		if (branch == node.null_byte) {
+			pos++;
+			return;
+		}
+		if (branch != node.value_byte) {
+			Skip(node, pos, end);
+			return;
+		}
+		pos++;
+	}
+	switch (node.fast) {
+	case AvroFast::BOOLEAN:
+		Need(pos, end, 1);
+		pos++;
+		return;
+	case AvroFast::INT:
+	case AvroFast::TIME_MILLIS:
+	case AvroFast::TIME_MICROS:
+	case AvroFast::LONG:
+	case AvroFast::TIMESTAMP_MILLIS:
+		SkipLong(pos, end);
+		return;
+	case AvroFast::FLOAT:
+		Need(pos, end, sizeof(float));
+		pos += sizeof(float);
+		return;
+	case AvroFast::DOUBLE:
+		Need(pos, end, sizeof(double));
+		pos += sizeof(double);
+		return;
+	case AvroFast::STRING:
+	case AvroFast::BYTES:
+		pos += ReadLength(pos, end);
+		return;
+	case AvroFast::NONE:
+		break;
+	}
+	Skip(node, pos, end);
+}
+
+AvroFast FastOf(AvroDecode decode) {
+	switch (decode) {
+	case AvroDecode::BOOLEAN:
+		return AvroFast::BOOLEAN;
+	case AvroDecode::INT:
+	case AvroDecode::DATE:
+		return AvroFast::INT;
+	case AvroDecode::TIME_MILLIS:
+		return AvroFast::TIME_MILLIS;
+	case AvroDecode::TIME_MICROS:
+		return AvroFast::TIME_MICROS;
+	case AvroDecode::LONG:
+		return AvroFast::LONG;
+	case AvroDecode::TIMESTAMP_MILLIS:
+		return AvroFast::TIMESTAMP_MILLIS;
+	case AvroDecode::FLOAT:
+		return AvroFast::FLOAT;
+	case AvroDecode::DOUBLE:
+		return AvroFast::DOUBLE;
+	case AvroDecode::STRING:
+		return AvroFast::STRING;
+	case AvroDecode::BYTES:
+		return AvroFast::BYTES;
+	default:
+		return AvroFast::NONE;
+	}
+}
+
+void HoldStrings(Vector &target, const vector<shared_ptr<RowBytes>> &pins) {
+	switch (target.GetType().InternalType()) {
+	case PhysicalType::VARCHAR:
+		for (auto &pin : pins) {
+			StringVector::AddAuxiliaryData(target, make_uniq<RowBytesHolder>(pin));
+		}
+		return;
+	case PhysicalType::STRUCT:
+		for (auto &child : StructVector::GetEntries(target)) {
+			HoldStrings(child, pins);
+		}
+		return;
+	case PhysicalType::LIST:
+		HoldStrings(ListVector::GetChildMutable(target), pins);
+		return;
+	default:
+		return;
+	}
+}
+
+} // namespace
+
+AvroNode AvroNode::Plan(const AvroType &type) {
+	AvroNode node;
+	node.kind = type.kind;
+	const auto id = type.duckdb_type.id();
+	switch (type.kind) {
+	case AvroKind::NULL_TYPE:
+		node.decode = AvroDecode::NULL_VALUE;
+		break;
+	case AvroKind::BOOLEAN:
+		node.decode = AvroDecode::BOOLEAN;
+		break;
+	case AvroKind::INT:
+		node.decode = id == LogicalTypeId::DATE   ? AvroDecode::DATE
+		              : id == LogicalTypeId::TIME ? AvroDecode::TIME_MILLIS
+		                                          : AvroDecode::INT;
+		break;
+	case AvroKind::LONG:
+		node.decode = id == LogicalTypeId::TIME           ? AvroDecode::TIME_MICROS
+		              : type.unit == AvroTimeUnit::MILLIS ? AvroDecode::TIMESTAMP_MILLIS
+		                                                  : AvroDecode::LONG;
+		break;
+	case AvroKind::FLOAT:
+		node.decode = AvroDecode::FLOAT;
+		break;
+	case AvroKind::DOUBLE:
+		node.decode = AvroDecode::DOUBLE;
+		break;
+	case AvroKind::STRING:
+		node.decode = id == LogicalTypeId::UUID ? AvroDecode::UUID_STRING : AvroDecode::STRING;
+		break;
+	case AvroKind::BYTES:
+		node.decode = id == LogicalTypeId::DECIMAL ? AvroDecode::DECIMAL_BYTES : AvroDecode::BYTES;
+		node.physical = type.duckdb_type.InternalType();
+		break;
+	case AvroKind::FIXED:
+		node.size = type.fixed_size;
+		node.physical = type.duckdb_type.InternalType();
+		node.decode = id == LogicalTypeId::UUID       ? AvroDecode::UUID_FIXED
+		              : id == LogicalTypeId::DECIMAL  ? AvroDecode::DECIMAL_FIXED
+		              : id == LogicalTypeId::INTERVAL ? AvroDecode::DURATION
+		                                              : AvroDecode::FIXED;
+		break;
+	case AvroKind::ENUM:
+		node.decode = AvroDecode::ENUM;
+		node.size = EnumType::GetSize(type.duckdb_type);
+		node.physical = type.duckdb_type.InternalType();
+		break;
+	case AvroKind::RECORD:
+		node.decode = id == LogicalTypeId::SQLNULL ? AvroDecode::EMPTY_RECORD : AvroDecode::RECORD;
+		for (auto &child : type.children) {
+			node.children.push_back(Plan(child.second));
+		}
+		break;
+	case AvroKind::ARRAY:
+		node.decode = id == LogicalTypeId::MAP ? AvroDecode::ARRAY_MAP : AvroDecode::ARRAY;
+		node.children.push_back(Plan(type.children[0].second));
+		break;
+	case AvroKind::MAP:
+		node.decode = AvroDecode::MAP;
+		node.children.push_back(Plan(type.children[1].second));
+		break;
+	case AvroKind::UNION:
+		node.decode = type.union_child_map.size() >= 2 ? AvroDecode::UNION : AvroDecode::NULLABLE;
+		for (idx_t i = 0; i < type.children.size(); i++) {
+			node.children.push_back(Plan(type.children[i].second));
+			auto member = type.union_child_map.find(i);
+			node.members.push_back(member == type.union_child_map.end() ? DConstants::INVALID_INDEX
+			                                                            : member->second.GetIndex());
+		}
+		break;
+	}
+	node.strings = node.decode == AvroDecode::STRING || node.decode == AvroDecode::BYTES ||
+	               node.decode == AvroDecode::FIXED || node.decode == AvroDecode::MAP;
+	for (auto &child : node.children) {
+		node.strings = node.strings || child.strings;
+	}
+	node.fast = FastOf(node.decode);
+	if (node.decode == AvroDecode::NULLABLE && node.children.size() == 2) {
+		const idx_t value = node.members[0] == DConstants::INVALID_INDEX ? 1 : 0;
+		const idx_t null = 1 - value;
+		if (node.members[value] != DConstants::INVALID_INDEX && node.children[null].decode == AvroDecode::NULL_VALUE &&
+		    node.children[value].fast != AvroFast::NONE) {
+			node.fast = node.children[value].fast;
+			node.null_byte = static_cast<uint8_t>(EncodingUtil::ZigZagEncode(static_cast<int64_t>(null)));
+			node.value_byte = static_cast<uint8_t>(EncodingUtil::ZigZagEncode(static_cast<int64_t>(value)));
+		}
+	}
+	return node;
+}
+
+static shared_ptr<CSVBufferManager> OpenAvroFile(ClientContext &context, const OpenFileInfo &file) {
+	CSVReaderOptions options;
+	return CSVBufferManager::Open(context, options, file, false,
+	                              CSVFileHandle::OpenFile(context, file, options, CachingMode::ALWAYS_CACHE));
+}
+
+AvroSource::AvroSource(ClientContext &context, OpenFileInfo file_p)
+    : ScanFile(context, file_p, OpenAvroFile(context, file_p)) {
+	auto &allocator = BufferAllocator::Get(context);
+	idx_t want = HEADER_READ_BYTES;
+	while (true) {
+		auto buffer = allocator.Allocate(want);
+		const idx_t got = Rows().ReadFully(char_ptr_cast(buffer.get()), want, 0);
+		if (AvroParseHeader(const_char_ptr_cast(buffer.get()), got, header)) {
+			skipped = header.size;
+			return;
+		}
+		if (got < want) {
+			if (got < AVRO_MAGIC_SIZE) {
+				throw InvalidInputException("Incorrect Avro container file magic number");
+			}
+			throw InvalidInputException("Avro file \"%s\" ends inside its header", file.path);
+		}
+		want *= 2;
+	}
+}
+
+AvroReaderGlobal::AvroReaderGlobal(ClientContext &context_p, shared_ptr<AvroSource> source_p, const AvroType &root,
+                                   AvroReaderColumns columns_p)
+    : context(context_p), source(std::move(source_p)), columns(std::move(columns_p)) {
+	const AvroType *record = &root;
+	if (root.kind == AvroKind::UNION && root.union_child_map.size() == 1) {
+		record_branch = root.union_child_map.begin()->first;
+		record = &root.children[record_branch].second;
+	}
+	if (record->duckdb_type.id() == LogicalTypeId::STRUCT) {
+		if (record != &root) {
+			root_union = make_uniq<AvroNode>(AvroNode::Plan(root));
+		}
+		for (auto &child : record->children) {
+			fields.push_back(AvroField {AvroNode::Plan(child.second)});
+		}
+	} else {
+		fields.push_back(AvroField {AvroNode::Plan(root)});
+	}
+	vector<bool> filtered;
+	for (auto &filter : columns.filters) {
+		if (filter.output_column >= filtered.size()) {
+			filtered.resize(filter.output_column + 1, false);
+		}
+		filtered[filter.output_column] = true;
+	}
+	for (auto &read : columns.reads) {
+		auto &field = fields[read.file_column];
+		field.output = read.output_column;
+		const bool filter = read.output_column < filtered.size() && filtered[read.output_column];
+		if (!columns.filters.empty() && !filter) {
+			field.role = AvroFieldRole::DEFER;
+			field.deferred = deferred++;
+		} else {
+			field.role = AvroFieldRole::DECODE;
+		}
+		walk = true;
+	}
+	const auto &header = source->header;
+	idx_t range_bytes = DConstants::INVALID_INDEX;
+	if (source->Stream()) {
+		stream_bytes = RowInput::StreamBytes(source->HostStream());
+		if (TaskScheduler::QueryThreads(context) > 1) {
+			range_bytes = stream_bytes;
+		}
+	} else if (TaskScheduler::QueryThreads(context) > 1) {
+		range_bytes = RowRanges::RangeBytes(source->Size(), TaskScheduler::QueryThreads(context), MIN_RANGE_BYTES,
+		                                    MAX_RANGE_BYTES);
+	}
+	ranges =
+	    make_uniq<RowRanges>(BufferAllocator::Get(context), source->Rows(), header.size, source->Size(), range_bytes);
+	ranges->path = source->Path();
+	if (!source->Stream() && ranges->RangeCount() > 1) {
+		chain_first.resize(ranges->RangeCount(), DConstants::INVALID_INDEX);
+		chain_end.resize(ranges->RangeCount(), DConstants::INVALID_INDEX);
+	}
+}
+
+idx_t AvroReaderGlobal::FinishBlocks(idx_t range, idx_t first_block, idx_t blocks_end) {
+	ranges->Finish(range);
+	if (chain_first.empty()) {
+		return DConstants::INVALID_INDEX;
+	}
+	lock_guard<mutex> guard(chain_lock);
+	chain_first[range] = first_block;
+	chain_end[range] = blocks_end;
+	if (++chain_finished < chain_first.size()) {
+		return DConstants::INVALID_INDEX;
+	}
+	idx_t expected = ranges->start;
+	for (idx_t i = 0; i < chain_first.size(); i++) {
+		if (chain_first[i] == DConstants::INVALID_INDEX) {
+			continue;
+		}
+		if (chain_first[i] != expected) {
+			return expected;
+		}
+		expected = chain_end[i];
+	}
+	return expected == ranges->Size() ? DConstants::INVALID_INDEX : expected;
+}
+
+idx_t AvroReaderGlobal::MaxThreads() const {
+	if (ranges->Intake()) {
+		return TaskScheduler::QueryThreads(context);
+	}
+	return ranges->RangeCount();
+}
+
+AvroReader::AvroReader(AvroReaderGlobal &global_p)
+    : global(global_p), header(global_p.source->header), window(*global_p.ranges),
+      decompressor(BufferAllocator::Get(global_p.context)) {
+	for (auto &filter : global.columns.filters) {
+		pushed_filters.Add(global.context, filter.filter.get(), filter.output_column);
+	}
+	filter_selection.Initialize(STANDARD_VECTOR_SIZE);
+	positions.resize(global.deferred * STANDARD_VECTOR_SIZE);
+	targets.resize(global.fields.size());
+}
+
+AvroReader::~AvroReader() {
+	if (claimed && !loaded && global.ranges->Intake()) {
+		global.ranges->FailIntake();
+	}
+}
+
+bool AvroReader::Claim() {
+	claimed = false;
+	if (!global.Claim(range)) {
+		return false;
+	}
+	claimed = true;
+	loaded = false;
+	return true;
+}
+
+idx_t AvroReader::Ensure(idx_t from, idx_t to) {
+	if (global.ranges->Intake()) {
+		return window.read_to;
+	}
+	while (window.read_to < to && window.read_to < global.ranges->Size()) {
+		const idx_t before = window.read_to;
+		const idx_t ahead = range_end > window.read_to ? MinValue(READ_BYTES, range_end - window.read_to) : 0;
+		window.Read(from, MaxValue(to - window.read_to, ahead));
+		if (window.read_to == before) {
 			break;
 		}
 	}
-	if (ret != 0 && ret != EOF) {
-		throw InvalidInputException(avro_strerror());
-	}
+	return window.read_to;
+}
 
-	// pull up root struct into output chunk
-	if (duckdb_type.id() == LogicalTypeId::STRUCT) {
-		for (idx_t col_idx = 0; col_idx < column_indexes.size(); col_idx++) {
-			if (column_indexes[col_idx].GetPrimaryIndex() >= columns.size()) {
-				continue; // to be filled in later
-			}
-			output.data[col_idx].Reference(
-			    StructVector::GetEntries(read_vec)[column_indexes[col_idx].GetPrimaryIndex()]);
-		}
-	} else {
-		output.data[column_indexes[0].GetPrimaryIndex()].Reference(read_vec);
+void AvroReader::Load() {
+	loaded = true;
+	auto &ranges = *global.ranges;
+	block_left = 0;
+	cursor = nullptr;
+	block_end = nullptr;
+	first_block = DConstants::INVALID_INDEX;
+	blocks_end = DConstants::INVALID_INDEX;
+	if (ranges.Intake()) {
+		LoadIntake();
+		return;
 	}
-	output.SetChildCardinality(out_idx);
+	const idx_t begin = ranges.RangeBegin(range);
+	range_end = ranges.RangeEnd(range);
+	if (begin == ranges.start) {
+		window.Start(begin, true);
+		next_block = begin;
+		searching = false;
+		return;
+	}
+	window.Start(begin - AVRO_SYNC_SIZE, true);
+	sync_from = begin - AVRO_SYNC_SIZE;
+	searching = true;
+	if (!FindSync(next_block)) {
+		next_block = range_end;
+	}
+}
+
+void AvroReader::LoadIntake() {
+	RowIntake intake(window);
+	if (!intake.Start(range, global.stream_bytes)) {
+		claimed = false;
+		return;
+	}
+	const idx_t begin = intake.claim.begin;
+	idx_t end = CutBlocks(begin);
+	if (window.read_to >= global.ranges->Size()) {
+		end = window.read_to;
+	} else if (end == begin) {
+		intake.CarryOn(RowSearch());
+		global.Finish(range);
+		claimed = false;
+		return;
+	}
+	intake.Cut(end);
+	next_block = begin;
+	range_end = end;
+	searching = false;
+}
+
+idx_t AvroReader::CutBlocks(idx_t begin) const {
+	idx_t end = begin;
+	while (end < window.read_to) {
+		const char *start = At(end);
+		const char *pos = start;
+		const char *limit = At(window.read_to);
+		int64_t count;
+		int64_t size;
+		if (!AvroReadBlockHeader(pos, limit, count, size)) {
+			return end;
+		}
+		if (count < 0 || size < 0) {
+			return window.read_to;
+		}
+		const idx_t data_start = end + static_cast<idx_t>(pos - start);
+		const auto length = static_cast<idx_t>(size);
+		if (length > window.read_to - data_start || window.read_to - data_start - length < AVRO_SYNC_SIZE) {
+			return end;
+		}
+		end = data_start + length + AVRO_SYNC_SIZE;
+		if (memcmp(At(end - AVRO_SYNC_SIZE), header.sync, AVRO_SYNC_SIZE) != 0) {
+			return end;
+		}
+	}
+	return end;
+}
+
+bool AvroReader::FindSync(idx_t &position) {
+	if (range_end < AVRO_SYNC_SIZE) {
+		return false;
+	}
+	const idx_t last = range_end - AVRO_SYNC_SIZE;
+	while (sync_from < last) {
+		const idx_t available = Ensure(sync_from, MinValue(sync_from + READ_BYTES, range_end));
+		if (available < sync_from + AVRO_SYNC_SIZE) {
+			return false;
+		}
+		const idx_t stop = MinValue(available - AVRO_SYNC_SIZE + 1, last);
+		const char *base = At(sync_from);
+		const idx_t span = stop - sync_from;
+		for (idx_t i = 0; i < span;) {
+			auto candidate = static_cast<const char *>(memchr(base + i, header.sync[0], span - i));
+			if (!candidate) {
+				break;
+			}
+			i = static_cast<idx_t>(candidate - base);
+			if (memcmp(candidate, header.sync, AVRO_SYNC_SIZE) == 0) {
+				position = sync_from + i + AVRO_SYNC_SIZE;
+				sync_from += i + 1;
+				return true;
+			}
+			i++;
+		}
+		sync_from = stop;
+		if (available >= global.ranges->Size()) {
+			return false;
+		}
+	}
+	return false;
+}
+
+bool AvroReader::ParseBlock(idx_t start, int64_t &count, idx_t &data_start, idx_t &size) {
+	const idx_t available = Ensure(KeepFrom(start), start + 2 * AVRO_MAX_VARINT_SIZE);
+	if (available <= start) {
+		return false;
+	}
+	const char *begin = At(start);
+	const char *pos = begin;
+	const char *limit = At(available);
+	int64_t raw_size;
+	if (!AvroReadBlockHeader(pos, limit, count, raw_size) || count < 0 || raw_size < 0) {
+		return false;
+	}
+	data_start = start + static_cast<idx_t>(pos - begin);
+	size = static_cast<idx_t>(raw_size);
+	if (size > global.ranges->Size() - data_start || global.ranges->Size() - data_start - size < AVRO_SYNC_SIZE) {
+		return false;
+	}
+	const idx_t sync_end = data_start + size + AVRO_SYNC_SIZE;
+	if (Ensure(KeepFrom(start), sync_end) < sync_end) {
+		return false;
+	}
+	return memcmp(At(data_start + size), header.sync, AVRO_SYNC_SIZE) == 0;
+}
+
+shared_ptr<RowBytes> AvroReader::PoolBuffer() {
+	for (auto &entry : pool) {
+		if (entry.use_count() == 1) {
+			return entry;
+		}
+	}
+	pool.push_back(make_shared_ptr<RowBytes>());
+	return pool.back();
+}
+
+void AvroReader::Pin(const shared_ptr<RowBytes> &bytes) {
+	if (pins.empty() || pins.back() != bytes) {
+		pins.push_back(bytes);
+	}
+}
+
+void AvroReader::OpenBlock(idx_t data_start, idx_t size) {
+	if (header.codec == AvroCodec::NONE) {
+		cursor = At(data_start);
+		block_end = cursor + size;
+		block_bytes = window.bytes;
+		Pin(block_bytes);
+		return;
+	}
+	auto buffer = PoolBuffer();
+	const idx_t length = decompressor.Decompress(header.codec, At(data_start), size, buffer->owned);
+	buffer->data = const_char_ptr_cast(buffer->owned.get());
+	buffer->size = length;
+	buffer->capacity = buffer->owned.GetSize();
+	cursor = buffer->data;
+	block_end = cursor + length;
+	block_bytes = std::move(buffer);
+	Pin(block_bytes);
+}
+
+bool AvroReader::NextBlock() {
+	while (true) {
+		if (next_block >= range_end || next_block >= global.ranges->Size()) {
+			return false;
+		}
+		int64_t count;
+		idx_t data_start;
+		idx_t size;
+		if (!ParseBlock(next_block, count, data_start, size)) {
+			if (searching) {
+				if (!FindSync(next_block)) {
+					next_block = range_end;
+				}
+				continue;
+			}
+			if (window.read_to <= next_block && next_block >= global.ranges->Size()) {
+				return false;
+			}
+			block_offset = next_block;
+			ThrowCorrupt("a block is truncated or does not end with the file's sync marker");
+		}
+		searching = false;
+		block_offset = next_block;
+		next_block = data_start + size + AVRO_SYNC_SIZE;
+		if (first_block == DConstants::INVALID_INDEX) {
+			first_block = block_offset;
+		}
+		blocks_end = next_block;
+		global.source->Consume(next_block - block_offset);
+		if (count == 0) {
+			continue;
+		}
+		block_left = static_cast<idx_t>(count);
+		record_index = 0;
+		if (global.walk) {
+			try {
+				OpenBlock(data_start, size);
+			} catch (const InvalidInputException &error) {
+				ThrowCorrupt(ErrorData(error).RawMessage());
+			}
+		}
+		return true;
+	}
+}
+
+void AvroReader::ThrowCorrupt(const string &detail) const {
+	throw InvalidInputException("Avro file \"%s\" is corrupt at the block at offset %llu: %s", global.source->Path(),
+	                            block_offset, detail);
+}
+
+bool AvroReader::RootBranch(const char *&pos, const char *end) {
+	if (!global.root_union) {
+		return true;
+	}
+	const idx_t branch = ReadBranch(*global.root_union, pos, end);
+	if (branch == global.record_branch) {
+		return true;
+	}
+	Skip(global.root_union->children[branch], pos, end);
+	return false;
+}
+
+void AvroReader::Walk(idx_t first, idx_t count, DataChunk &output) {
+	const char *pos = cursor;
+	const char *end = block_end;
+	for (idx_t row = first; row < first + count; row++) {
+		row_ends[row] = end;
+		if (!RootBranch(pos, end)) {
+			for (auto &field : global.fields) {
+				if (field.role == AvroFieldRole::DECODE) {
+					SetNull(output.data[field.output], row);
+				} else if (field.role == AvroFieldRole::DEFER) {
+					positions[field.deferred * STANDARD_VECTOR_SIZE + row] = nullptr;
+				}
+			}
+			continue;
+		}
+		for (idx_t f = 0; f < global.fields.size(); f++) {
+			auto &field = global.fields[f];
+			switch (field.role) {
+			case AvroFieldRole::SKIP:
+				SkipFast(field.node, pos, end);
+				break;
+			case AvroFieldRole::DECODE:
+				DecodeFast(field.node, pos, end, targets[f], row);
+				break;
+			case AvroFieldRole::DEFER:
+				positions[field.deferred * STANDARD_VECTOR_SIZE + row] = pos;
+				SkipFast(field.node, pos, end);
+				break;
+			}
+		}
+	}
+	cursor = pos;
+}
+
+void AvroReader::Target(DataChunk &output, const AvroField &field) {
+	auto &target = targets[&field - global.fields.data()];
+	target.vector = &output.data[field.output];
+	target.data = FlatVector::GetDataMutableUnsafe(*target.vector);
+	target.validity = &FlatVector::ValidityMutable(*target.vector);
+}
+
+idx_t AvroReader::Fill(DataChunk &output) {
+	const bool numbered = global.columns.file_row_number != DConstants::INVALID_INDEX;
+	for (auto &field : global.fields) {
+		if (field.role == AvroFieldRole::DECODE) {
+			Target(output, field);
+		}
+	}
+	idx_t rows = 0;
+	while (rows < STANDARD_VECTOR_SIZE) {
+		if (block_left == 0 && !NextBlock()) {
+			break;
+		}
+		const idx_t take = MinValue(block_left, STANDARD_VECTOR_SIZE - rows);
+		if (global.walk) {
+			try {
+				Walk(rows, take, output);
+			} catch (const InvalidInputException &error) {
+				ThrowCorrupt(ErrorData(error).RawMessage());
+			}
+		}
+		if (numbered) {
+			if (block_offset >= MAX_BLOCK_OFFSET || record_index + take > (idx_t(1) << RECORD_INDEX_BITS)) {
+				throw InvalidInputException("Avro file \"%s\" has a block at offset %llu that file_row_number cannot "
+				                            "address: blocks must start below %llu and hold at most %llu records",
+				                            global.source->Path(), block_offset, MAX_BLOCK_OFFSET,
+				                            idx_t(1) << RECORD_INDEX_BITS);
+			}
+			const auto base = static_cast<int64_t>(block_offset << RECORD_INDEX_BITS);
+			for (idx_t i = 0; i < take; i++) {
+				identities[rows + i] = base + static_cast<int64_t>(record_index + i);
+			}
+		}
+		rows += take;
+		block_left -= take;
+		record_index += take;
+		if (block_left == 0 && global.walk && cursor != block_end) {
+			ThrowCorrupt("the records of a block do not fill its data");
+		}
+	}
+	return rows;
+}
+
+idx_t AvroReader::ApplyFilters(DataChunk &output, idx_t rows, bool lookup) {
+	filter_selection.Initialize(nullptr);
+	const auto approved = pushed_filters.Apply(filter_selection, output, rows, rows);
+	if (approved == rows) {
+		return rows;
+	}
+	const auto slice = [&](Vector &vector) {
+		vector.Slice(filter_selection, approved);
+		vector.Flatten(approved);
+	};
+	for (auto &field : global.fields) {
+		if (field.role == AvroFieldRole::DECODE || (lookup && field.role == AvroFieldRole::DEFER)) {
+			slice(output.data[field.output]);
+		}
+	}
+	if (global.columns.file_row_number != DConstants::INVALID_INDEX) {
+		slice(output.data[global.columns.file_row_number]);
+	}
+	return approved;
+}
+
+idx_t AvroReader::Complete(DataChunk &output, idx_t rows) {
+	for (auto &field : global.fields) {
+		if (field.role != AvroFieldRole::SKIP && field.node.strings) {
+			HoldStrings(output.data[field.output], pins);
+		}
+	}
+	const idx_t numbers_column = global.columns.file_row_number;
+	if (numbers_column != DConstants::INVALID_INDEX) {
+		auto numbers = FlatVector::Writer<int64_t>(output.data[numbers_column], rows);
+		for (idx_t i = 0; i < rows; i++) {
+			numbers.WriteValue(identities[i]);
+		}
+	}
+	output.SetChildCardinality(rows);
+	idx_t count = rows;
+	if (!global.columns.filters.empty()) {
+		count = ApplyFilters(output, rows, false);
+		if (count == 0) {
+			return 0;
+		}
+	}
+	const bool all = count == rows;
+	if (global.deferred) {
+		try {
+			for (auto &field : global.fields) {
+				if (field.role != AvroFieldRole::DEFER) {
+					continue;
+				}
+				Target(output, field);
+				auto &target = targets[&field - global.fields.data()];
+				auto base = positions.data() + field.deferred * STANDARD_VECTOR_SIZE;
+				for (idx_t i = 0; i < count; i++) {
+					const idx_t row = all ? i : filter_selection.get_index(i);
+					const char *pos = base[row];
+					if (!pos) {
+						SetNull(*target.vector, i);
+						continue;
+					}
+					DecodeFast(field.node, pos, row_ends[row], target, i);
+				}
+			}
+		} catch (const InvalidInputException &error) {
+			ThrowCorrupt(ErrorData(error).RawMessage());
+		}
+	}
+	output.SetChildCardinality(count);
+	return count;
+}
+
+idx_t AvroReader::Scan(DataChunk &output) {
+	while (claimed) {
+		output.Reset();
+		pins.clear();
+		if (!loaded) {
+			Load();
+			if (!claimed) {
+				return 0;
+			}
+		} else if (block_left != 0 && block_bytes) {
+			Pin(block_bytes);
+		}
+		const idx_t rows = Fill(output);
+		if (rows == 0) {
+			const idx_t gap = global.FinishBlocks(range, first_block, blocks_end);
+			claimed = false;
+			if (gap != DConstants::INVALID_INDEX) {
+				block_offset = gap;
+				ThrowCorrupt("a block is truncated or does not end with the file's sync marker");
+			}
+			return 0;
+		}
+		const idx_t count = Complete(output, rows);
+		if (count != 0) {
+			return count;
+		}
+	}
+	return 0;
+}
+
+bool AvroReader::LookupBlock(RowLookup &lookup, idx_t block, idx_t &records) {
+	auto &ranges = *global.ranges;
+	if (block < ranges.start || block >= ranges.Size()) {
+		return false;
+	}
+	const auto found = lookup.Find(block, block, LOOKUP_BYTES);
+	if (!found.IsValid()) {
+		return false;
+	}
+	const idx_t base = found.GetIndex();
+	if (lookup.End() - base < 2 * AVRO_MAX_VARINT_SIZE && !lookup.Eof()) {
+		lookup.Extend(LOOKUP_BYTES);
+	}
+	const char *begin = lookup.bytes->data + base;
+	const char *pos = begin;
+	const char *limit = begin + (lookup.End() - base);
+	int64_t count;
+	int64_t size;
+	if (!AvroReadBlockHeader(pos, limit, count, size) || count < 0 || size < 0) {
+		return false;
+	}
+	const auto data_offset = static_cast<idx_t>(pos - begin);
+	const idx_t length = static_cast<idx_t>(size);
+	const idx_t total = data_offset + length + AVRO_SYNC_SIZE;
+	while (lookup.End() - base < total && !lookup.Eof()) {
+		lookup.Extend(total - (lookup.End() - base));
+	}
+	if (lookup.End() - base < total) {
+		return false;
+	}
+	const char *data = lookup.bytes->data + base + data_offset;
+	if (memcmp(data + length, header.sync, AVRO_SYNC_SIZE) != 0) {
+		return false;
+	}
+	auto buffer = PoolBuffer();
+	idx_t decoded = length;
+	if (header.codec == AvroCodec::NONE) {
+		if (buffer->owned.GetSize() < length + AVRO_PADDING) {
+			buffer->owned = BufferAllocator::Get(global.context).Allocate(length + AVRO_PADDING);
+		}
+		memcpy(buffer->owned.get(), data, length);
+		memset(buffer->owned.get() + length, 0, AVRO_PADDING);
+	} else {
+		decoded = decompressor.Decompress(header.codec, data, length, buffer->owned);
+	}
+	buffer->data = const_char_ptr_cast(buffer->owned.get());
+	buffer->size = decoded;
+	buffer->capacity = buffer->owned.GetSize();
+	cursor = buffer->data;
+	block_end = cursor + decoded;
+	block_bytes = std::move(buffer);
+	Pin(block_bytes);
+	block_offset = block;
+	records = static_cast<idx_t>(count);
+	return true;
+}
+
+idx_t AvroReader::Lookup(std::span<const int64_t> rows, std::span<idx_t> survivors, DataChunk &output) {
+	output.Reset();
+	pins.clear();
+	RowLookup lookup(*global.ranges);
+	constexpr idx_t record_mask = (idx_t(1) << RECORD_INDEX_BITS) - 1;
+	idx_t current = DConstants::INVALID_INDEX;
+	idx_t records = 0;
+	idx_t next_record = 0;
+	idx_t found = 0;
+	for (idx_t i = 0; i < rows.size(); i++) {
+		if (rows[i] < 0) {
+			continue;
+		}
+		const auto row = static_cast<idx_t>(rows[i]);
+		const idx_t block = row >> RECORD_INDEX_BITS;
+		const idx_t index = row & record_mask;
+		if (block != current || index < next_record) {
+			current = DConstants::INVALID_INDEX;
+			try {
+				if (!LookupBlock(lookup, block, records)) {
+					continue;
+				}
+			} catch (const InvalidInputException &error) {
+				block_offset = block;
+				ThrowCorrupt(ErrorData(error).RawMessage());
+			}
+			current = block;
+			next_record = 0;
+		}
+		if (index >= records) {
+			continue;
+		}
+		try {
+			for (; next_record < index; next_record++) {
+				if (RootBranch(cursor, block_end)) {
+					for (auto &field : global.fields) {
+						Skip(field.node, cursor, block_end);
+					}
+				}
+			}
+			const bool present = RootBranch(cursor, block_end);
+			for (auto &field : global.fields) {
+				if (field.role == AvroFieldRole::SKIP) {
+					if (present) {
+						Skip(field.node, cursor, block_end);
+					}
+				} else if (present) {
+					Decode(field.node, cursor, block_end, output.data[field.output], found);
+				} else {
+					SetNull(output.data[field.output], found);
+				}
+			}
+		} catch (const InvalidInputException &error) {
+			ThrowCorrupt(ErrorData(error).RawMessage());
+		}
+		next_record++;
+		identities[found] = rows[i];
+		survivors[found] = i;
+		found++;
+	}
+	for (auto &field : global.fields) {
+		if (field.role != AvroFieldRole::SKIP && field.node.strings) {
+			HoldStrings(output.data[field.output], pins);
+		}
+	}
+	const idx_t numbers_column = global.columns.file_row_number;
+	if (numbers_column != DConstants::INVALID_INDEX) {
+		auto numbers = FlatVector::Writer<int64_t>(output.data[numbers_column], found);
+		for (idx_t r = 0; r < found; r++) {
+			numbers.WriteValue(identities[r]);
+		}
+	}
+	output.SetChildCardinality(found);
+	if (!global.columns.filters.empty() && found != 0) {
+		const idx_t approved = ApplyFilters(output, found, true);
+		for (idx_t r = 0; r < approved && approved != found; r++) {
+			survivors[r] = survivors[filter_selection.get_index(r)];
+		}
+		found = approved;
+		output.SetChildCardinality(found);
+	}
+	return found;
 }
 
 } // namespace duckdb

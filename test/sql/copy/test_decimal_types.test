@@ -164,3 +164,26 @@ select * from read_avro('{TEST_DIR}/test_decimal_struct.avro');
 ----
 {'a': 12.1234, 'b': 12345.12345}
 
+
+# the largest and smallest value of every precision round-trips: the fixed size holds the sign bit too, which takes
+# an extra byte at precisions 7, 12, 19, 24 and 36
+statement ok
+COPY (
+	SELECT 9999999::DECIMAL(7,0) AS p7, -9999999::DECIMAL(7,0) AS n7,
+	       99999.99::DECIMAL(7,2) AS s7,
+	       999999999999::DECIMAL(12,0) AS p12, -999999999999::DECIMAL(12,0) AS n12,
+	       9999999999999999999::DECIMAL(19,0) AS p19, -9999999999999999999::DECIMAL(19,0) AS n19,
+	       repeat('9', 24)::DECIMAL(24,0) AS p24, ('-' || repeat('9', 24))::DECIMAL(24,0) AS n24,
+	       repeat('9', 36)::DECIMAL(36,0) AS p36, ('-' || repeat('9', 36))::DECIMAL(36,0) AS n36
+) TO '{TEST_DIR}/decimal_widths.avro';
+
+query IIIIIIIIIII
+SELECT * FROM read_avro('{TEST_DIR}/decimal_widths.avro');
+----
+9999999	-9999999	99999.99	999999999999	-999999999999	9999999999999999999	-9999999999999999999	999999999999999999999999	-999999999999999999999999	999999999999999999999999999999999999	-999999999999999999999999999999999999
+
+query II
+SELECT regexp_extract_all(value, '"size":([0-9]+)', 1)[1:5], regexp_extract_all(value, '"precision":([0-9]+)', 1)[1:5]
+FROM avro_metadata('{TEST_DIR}/decimal_widths.avro') WHERE key = 'avro.schema';
+----
+[4, 4, 4, 6, 6]	[7, 7, 7, 12, 12]
