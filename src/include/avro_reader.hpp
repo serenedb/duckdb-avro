@@ -23,39 +23,12 @@
 
 namespace duckdb {
 
-class AvroSource {
+class AvroSource : public ScanFile {
 public:
 	AvroSource(ClientContext &context, OpenFileInfo file);
 
-	const string &Path() const {
-		return file.path;
-	}
-	RowSource &Rows() const {
-		return input->Rows();
-	}
-	idx_t Size() const {
-		return input->size;
-	}
-	bool Stream() const {
-		return input->stream;
-	}
-	bool HostStream() const {
-		return input->host_stream != nullptr;
-	}
-	void ReadInOrder();
-	void Consume(idx_t bytes) {
-		consumed += bytes;
-	}
-	double Progress() const;
-
 public:
-	OpenFileInfo file;
 	AvroHeader header;
-
-private:
-	shared_ptr<CSVBufferManager> manager;
-	unique_ptr<RowInput> input;
-	atomic<idx_t> consumed {0};
 };
 
 enum class AvroDecode : uint8_t {

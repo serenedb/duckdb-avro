@@ -751,17 +751,21 @@ AvroNode AvroNode::Plan(const AvroType &type) {
 	return node;
 }
 
-AvroSource::AvroSource(ClientContext &context, OpenFileInfo file_p) : file(std::move(file_p)) {
+static shared_ptr<CSVBufferManager> OpenAvroFile(ClientContext &context, const OpenFileInfo &file) {
 	CSVReaderOptions options;
-	manager = CSVBufferManager::Open(context, options, file, false,
-	                                 CSVFileHandle::OpenFile(context, file, options, CachingMode::ALWAYS_CACHE));
-	input = make_uniq<RowInput>(context, *manager, file.path, true, &consumed);
+	return CSVBufferManager::Open(context, options, file, false,
+	                              CSVFileHandle::OpenFile(context, file, options, CachingMode::ALWAYS_CACHE));
+}
+
+AvroSource::AvroSource(ClientContext &context, OpenFileInfo file_p)
+    : ScanFile(context, file_p, OpenAvroFile(context, file_p)) {
 	auto &allocator = BufferAllocator::Get(context);
 	idx_t want = HEADER_READ_BYTES;
 	while (true) {
 		auto buffer = allocator.Allocate(want);
 		const idx_t got = Rows().ReadFully(char_ptr_cast(buffer.get()), want, 0);
 		if (AvroParseHeader(const_char_ptr_cast(buffer.get()), got, header)) {
+			skipped = header.size;
 			return;
 		}
 		if (got < want) {
@@ -772,22 +776,6 @@ AvroSource::AvroSource(ClientContext &context, OpenFileInfo file_p) : file(std::
 		}
 		want *= 2;
 	}
-}
-
-void AvroSource::ReadInOrder() {
-	if (input->file) {
-		input->file->in_order = true;
-	}
-}
-
-double AvroSource::Progress() const {
-	const idx_t size = input->host_stream ? 0 : manager->file_handle->FileSize();
-	if (size == 0) {
-		return 0;
-	}
-	const double position =
-	    Stream() ? manager->file_handle->GetProgress() : static_cast<double>(header.size + consumed.load());
-	return MinValue<double>(position / static_cast<double>(size), 1.0);
 }
 
 AvroReaderGlobal::AvroReaderGlobal(ClientContext &context_p, shared_ptr<AvroSource> source_p, const AvroType &root,
