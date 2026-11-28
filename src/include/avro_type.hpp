@@ -147,29 +147,20 @@ public:
 	}
 
 public:
-	//! The DuckDB type of this Avro type before unions with null are dissolved - STRUCT for a record, LIST or MAP for
-	//! an array, MAP for a map, UNION for a union, SQLNULL for null and for a record without fields
 	LogicalType duckdb_type;
 	AvroKind kind = AvroKind::NULL_TYPE;
-	//! Record fields, the item type of an array ("list_entry"), the key and value types of a map ("key_entry",
-	//! "value_entry"), or the branches of a union ("u0", "u1", ...)
 	child_list_t<AvroType> children;
-	//! For a union: the DuckDB member index of every branch that is not null
 	unordered_map<idx_t, optional_idx> union_child_map;
 	int32_t field_id = NumericLimits<int32_t>::Maximum();
-	//! For int and long values of temporal logical types: the unit the file stores them in
 	AvroTimeUnit unit = AvroTimeUnit::NONE;
-	//! For fixed: its size in bytes
 	idx_t fixed_size = 0;
 };
 
 struct AvroSchema {
 	AvroType type;
-	//! The name of the root schema, or "avro_schema" when it has none
 	string root_name;
 };
 
-//! Parses the JSON of an Avro schema (the "avro.schema" header entry) into its DuckDB form
 AvroSchema ParseAvroSchema(const string &json);
 
 } // namespace duckdb
