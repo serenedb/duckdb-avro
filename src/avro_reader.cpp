@@ -14,6 +14,7 @@
 #include "duckdb/common/vector/vector_writer.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_file_handle.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_reader_options.hpp"
+#include "duckdb/formats/value_parsers.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "simdutf.h"
@@ -92,11 +93,11 @@ inline idx_t ReadBranch(const AvroNode &node, const char *&pos, const char *end)
 	return micros;
 }
 
-inline string_t StringRef(const char *pos, idx_t length) {
+[[gnu::always_inline]] inline void StringRef(const char *pos, idx_t length, const char *end, string_t &out) {
 	if (length > NumericLimits<uint32_t>::Maximum()) {
 		ThrowData("a string or bytes value is larger than 4 GiB");
 	}
-	return string_t(pos, static_cast<uint32_t>(length));
+	MakeString(pos, length, end, out);
 }
 
 [[gnu::always_inline]] inline bool IsAscii(const char *data, idx_t size) {
@@ -303,7 +304,7 @@ void DecodeMap(const AvroNode &node, const char *&pos, const char *end, Vector &
 		for (idx_t i = 0; i < count; i++) {
 			const idx_t length = ReadLength(pos, end);
 			CheckUtf8(pos, length);
-			key_data[offset + total + i] = StringRef(pos, length);
+			StringRef(pos, length, end, key_data[offset + total + i]);
 			pos += length;
 			Decode(node.children[0], pos, end, values, offset + total + i);
 		}
@@ -382,7 +383,7 @@ void Decode(const AvroNode &node, const char *&pos, const char *end, Vector &tar
 	case AvroDecode::STRING: {
 		const idx_t length = ReadLength(pos, end);
 		CheckUtf8(pos, length);
-		FlatVector::GetDataMutableUnsafe<string_t>(target)[row] = StringRef(pos, length);
+		StringRef(pos, length, end, FlatVector::GetDataMutableUnsafe<string_t>(target)[row]);
 		pos += length;
 		return;
 	}
@@ -398,7 +399,7 @@ void Decode(const AvroNode &node, const char *&pos, const char *end, Vector &tar
 	}
 	case AvroDecode::BYTES: {
 		const idx_t length = ReadLength(pos, end);
-		FlatVector::GetDataMutableUnsafe<string_t>(target)[row] = StringRef(pos, length);
+		StringRef(pos, length, end, FlatVector::GetDataMutableUnsafe<string_t>(target)[row]);
 		pos += length;
 		return;
 	}
@@ -410,7 +411,7 @@ void Decode(const AvroNode &node, const char *&pos, const char *end, Vector &tar
 	}
 	case AvroDecode::FIXED:
 		Need(pos, end, node.size);
-		FlatVector::GetDataMutableUnsafe<string_t>(target)[row] = StringRef(pos, node.size);
+		StringRef(pos, node.size, end, FlatVector::GetDataMutableUnsafe<string_t>(target)[row]);
 		pos += node.size;
 		return;
 	case AvroDecode::UUID_FIXED:
@@ -551,13 +552,13 @@ template <class T>
 	case AvroFast::STRING: {
 		const idx_t length = ReadLength(pos, end);
 		CheckUtf8(pos, length);
-		Store<string_t>(target, row, StringRef(pos, length));
+		StringRef(pos, length, end, reinterpret_cast<string_t *>(target.data)[row]);
 		pos += length;
 		return;
 	}
 	case AvroFast::BYTES: {
 		const idx_t length = ReadLength(pos, end);
-		Store<string_t>(target, row, StringRef(pos, length));
+		StringRef(pos, length, end, reinterpret_cast<string_t *>(target.data)[row]);
 		pos += length;
 		return;
 	}
